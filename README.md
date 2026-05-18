@@ -661,6 +661,17 @@ SELECT * FROM (
 
 ## Performance
 
+### RAG Benchmarks
+
+FIQA retrieval benchmark on commit `d200081a458df46ac0cb9964c6a23da194263a30` with 57,638 `text-embedding-3-small` corpus vectors, 648 test queries, cosine distance, `k = 10`, 3 measured passes, 1 warmup pass, and `hnsw.ef_search = 64`.
+
+| Method | Build ms | Index MB | p50 ms | p95 ms | p99 ms | nDCG@10 | qrels recall@10 | exact recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TurboQuant graph, 4-bit | 44,076.171 | 455.258 | 1.271 | 2.705 | 5.462 | 0.4410 | 0.5163 | 0.9818 |
+| HNSW | 77,641.269 | 450.039 | 2.001 | 4.511 | 7.928 | 0.4438 | 0.5182 | 0.9914 |
+
+On this run, TurboQuant graph builds 1.76x faster and improves p50/p95/p99 latency by 1.57x/1.67x/1.45x, with slightly lower retrieval quality than HNSW.
+
 ### Tuning
 
 Use a tool like [PgTune](https://pgtune.leopard.in.ua/) to set initial values for Postgres server parameters. For instance, `shared_buffers` should typically be 25% of the server’s memory. You can find the config file with:

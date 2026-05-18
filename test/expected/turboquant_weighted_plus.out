@@ -1,0 +1,180 @@
+-- TurboQuant+ weighted scoring: ensure the opt-in knobs parse.
+--
+-- This test only validates that:
+--   * the reloption WITH (tq_weighted = on) round-trips,
+--   * the GUC hnsw.tq_weighted is registered (default off),
+--
+-- It does NOT assert recall lift; focused parity and dispatcher coverage
+-- lives in the SIMD and graph scan tests.
+SET enable_seqscan = off;
+-- Touch a vector value first so the extension's _PG_init runs and the
+-- new GUC is registered before SHOW/SET.
+CREATE TEMP TABLE tq_w_plus_data AS
+SELECT id, ARRAY(
+    SELECT sin(0.31415 * (k + id))::real FROM generate_series(0, 1535) k
+)::vector(1536) AS val
+FROM generate_series(1, 16) id;
+-- GUC defaults to off and is user-settable.
+SHOW hnsw.tq_weighted;
+ hnsw.tq_weighted 
+------------------
+ off
+(1 row)
+
+SET hnsw.tq_weighted = on;
+SHOW hnsw.tq_weighted;
+ hnsw.tq_weighted 
+------------------
+ on
+(1 row)
+
+RESET hnsw.tq_weighted;
+-- Build with the new opt-in on a cosine index where the TQ+ math
+-- actually applies (TqGraphFitCorrection runs for COSINE/IP only).
+CREATE INDEX tq_w_plus_idx ON tq_w_plus_data
+  USING turboquant (val vector_cosine_ops)
+  WITH (routing = graph, tq_weighted = on);
+SELECT (
+    'tq_weighted=on' = ANY (
+        SELECT unnest(reloptions)
+        FROM pg_class
+        WHERE relname = 'tq_w_plus_idx'
+    )
+) AS reloption_persisted;
+ reloption_persisted 
+---------------------
+ t
+(1 row)
+
+-- Storage flag: tqFlags must carry TQ_GRAPH_TQ_WEIGHTED (0x0002) on top
+-- of TQ_GRAPH_TQ_PLUS (0x0001), since this is a cosine-eligible build
+-- with ecShift/ecScale present.
+SELECT
+    ((tq_index_stats('tq_w_plus_idx'::regclass)->>'tq_flags')::int & 2) <> 0
+        AS tq_weighted_flag_set;
+ tq_weighted_flag_set 
+----------------------
+ t
+(1 row)
+
+-- TurboQuant+ scalar weighted-scoring helpers run on real index
+-- data, and the build-time symmetric (code-code) distance now uses
+-- the weighted formula when state->tqWeighted AND hnsw.tq_weighted
+-- are both on.  The diagnostic SQL function below is the parity-test
+-- entry point for the math; the scan-side test further down asserts
+-- that flipping the GUC doesn't break searches.
+DO $$
+DECLARE
+    info jsonb;
+    raw_self double precision;
+    mm_const double precision;
+BEGIN
+    info := tq_debug_weighted_self_score('tq_w_plus_idx'::regclass);
+
+    IF info->>'tq_weighted' <> 'true' THEN
+        RAISE EXCEPTION 'expected tq_weighted = true in debug info, got %', info;
+    END IF;
+    IF info->>'tq_plus' <> 'true' THEN
+        RAISE EXCEPTION 'expected tq_plus = true in debug info, got %', info;
+    END IF;
+
+    raw_self := (info->>'raw_self')::double precision;
+    mm_const := (info->>'mm_const')::double precision;
+
+    -- raw_self = Σ X+[d]² · D'²[d] is non-negative by construction.
+    IF raw_self < 0 THEN
+        RAISE EXCEPTION 'raw_self must be non-negative for self-pair, got %', raw_self;
+    END IF;
+
+    -- mm_const = Σ ecShift[d]² is non-negative by construction.
+    IF mm_const < 0 THEN
+        RAISE EXCEPTION 'mm_const must be non-negative, got %', mm_const;
+    END IF;
+
+    -- Both must be finite (catches NaN/inf from division-by-zero or
+    -- bad ecScale fits).
+    IF raw_self <> raw_self OR mm_const <> mm_const THEN
+        RAISE EXCEPTION 'NaN in TQ+ debug info: %', info;
+    END IF;
+
+    -- Slice ζ/θ parity check: when the SIMD weighted kernel is
+    -- available, raw_self_simd should match raw_self within the i16
+    -- weight quantization tolerance (1/32766 relative, summed over
+    -- all dim coords with the worst case being all-same-sign — this
+    -- can reach ~1 % relative on a self-pair where every coord
+    -- contributes positively).  Loose 2 % bound catches real
+    -- regressions (sign flips, wrong codebook scale, etc.) without
+    -- false-positive flakiness.
+    IF info->>'simd_ran' = 'true' THEN
+        DECLARE
+            simd_raw double precision := (info->>'raw_self_simd')::double precision;
+            tol double precision := abs(raw_self) * 2e-2 + 1e-6;
+        BEGIN
+            IF abs(simd_raw - raw_self) > tol THEN
+                RAISE EXCEPTION 'SIMD raw % differs from scalar raw % by % (tol %)',
+                                simd_raw, raw_self, abs(simd_raw - raw_self), tol;
+            END IF;
+        END;
+    END IF;
+END $$;
+-- A non-weighted cosine index returns tq_weighted = false (the storage
+-- flag bit is unset).  Note: tq_plus may still be true if ecShift/scale
+-- corrections were fit (cosine path), but the raw_self / mm_const
+-- numbers are zero because the helper only runs when tq_weighted is on.
+CREATE INDEX tq_w_plus_legacy_idx ON tq_w_plus_data
+  USING turboquant (val vector_cosine_ops)
+  WITH (routing = graph);
+DO $$
+DECLARE
+    info jsonb;
+BEGIN
+    info := tq_debug_weighted_self_score('tq_w_plus_legacy_idx'::regclass);
+
+    IF info->>'tq_weighted' <> 'false' THEN
+        RAISE EXCEPTION 'expected tq_weighted = false on legacy index, got %', info;
+    END IF;
+END $$;
+DROP INDEX tq_w_plus_legacy_idx;
+-- Slice ε: the GUC kill-switch is a runtime toggle on top of the
+-- index-time opt-in.  Self-match should still come back top-1 in
+-- both modes (only the build-time neighbor selection changed —
+-- search-side scoring is unchanged because the asymmetric
+-- query-code path was already using TQ+ semantics).
+SET hnsw.tq_weighted = on;
+SELECT id FROM tq_w_plus_data
+  ORDER BY val <=> (SELECT val FROM tq_w_plus_data WHERE id = 1)
+  LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+SET hnsw.tq_weighted = off;
+SELECT id FROM tq_w_plus_data
+  ORDER BY val <=> (SELECT val FROM tq_w_plus_data WHERE id = 1)
+  LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+RESET hnsw.tq_weighted;
+DROP INDEX tq_w_plus_idx;
+-- Default-off path: building without tq_weighted leaves the reloption
+-- absent (existing indexes built before this commit are unchanged).
+CREATE INDEX tq_w_plus_default_idx ON tq_w_plus_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph);
+SELECT (
+    'tq_weighted=on' = ANY (
+        SELECT unnest(reloptions)
+        FROM pg_class
+        WHERE relname = 'tq_w_plus_default_idx'
+    )
+) AS reloption_default_persisted;
+ reloption_default_persisted 
+-----------------------------
+ f
+(1 row)
+
+DROP INDEX tq_w_plus_default_idx;

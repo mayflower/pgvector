@@ -59,6 +59,7 @@
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 
 #if PG_VERSION_NUM >= 160000
@@ -96,7 +97,7 @@ CreateMetaPage(HnswBuildState * buildstate)
 
 	buf = HnswNewBuffer(index, forkNum);
 	page = BufferGetPage(buf);
-	HnswInitPage(buf, page);
+	HnswInitPageKind(buf, page, HNSW_PAGE_KIND_META);
 
 	/* Set metapage data */
 	metap = HnswPageGetMeta(page);
@@ -105,10 +106,26 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->dimensions = buildstate->dimensions;
 	metap->m = buildstate->m;
 	metap->efConstruction = buildstate->efConstruction;
+	if (HnswUseTqGraph(index))
+		metap->storageKind = HNSW_STORAGE_TURBOQUANT_GRAPH;
+	else if (HnswUseTqFlat(index))
+		metap->storageKind = HNSW_STORAGE_TURBOQUANT_FLAT;
+	else
+		metap->storageKind = HNSW_STORAGE_HNSW;
+	metap->graphEfSearch = HnswUseTqGraph(index) ? HnswGetEfSearch(index) : 0;
+	metap->graphOversampling = HnswUseTqGraph(index) ? HnswGetGraphOversampling(index) : 0;
+	metap->graphRescoreBand = HnswUseTqGraph(index) ? HnswGetGraphRescoreBand(index) : 0;
+	metap->graphMaxLevel = buildstate->maxLevel;
+	metap->graphFlags = HnswUseTqCodes(index) ? 1 : 0;
+	metap->tqBits = TQ_DEFAULT_BITS;
 	metap->entryBlkno = InvalidBlockNumber;
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+	metap->tqCodeStartBlkno = InvalidBlockNumber;
+	metap->tqAdjStartBlkno = InvalidBlockNumber;
+	metap->tqExactStartBlkno = InvalidBlockNumber;
+	metap->tqCorrectionStartBlkno = InvalidBlockNumber;
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
@@ -127,6 +144,7 @@ HnswBuildAppendPage(Relation index, Buffer *buf, Page *page, ForkNumber forkNum)
 
 	/* Update previous page */
 	HnswPageGetOpaque(*page)->nextblkno = BufferGetBlockNumber(newbuf);
+	HnswMarkPageGraphOp(*page, HNSW_GRAPH_OP_PAGE_LINK);
 
 	/* Commit */
 	MarkBufferDirty(*buf);
@@ -189,7 +207,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		etupSize = HnswElementTupleSize(index, valuePtr);
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -199,7 +217,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("index tuple too large")));
 
-		HnswSetElementTuple(base, etup, element);
+		HnswSetElementTuple(index, base, etup, element);
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -221,17 +239,19 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 		ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
 
-		/* Add element */
-		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
-			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	/* Add element */
+	if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_ELEMENT_INSERT);
 
 		/* Add new page if needed */
 		if (PageGetFreeSpace(page) < ntupSize)
 			HnswBuildAppendPage(index, &buf, &page, forkNum);
 
-		/* Add placeholder for neighbors */
-		if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
-			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	/* Add placeholder for neighbors */
+	if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_INSERT);
 	}
 
 	insertPage = BufferGetBlockNumber(buf);
@@ -288,6 +308,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 
 		if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
 
 		/* Commit */
 		MarkBufferDirty(buf);
@@ -1156,6 +1177,54 @@ hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result->index_tuples = buildstate.indtuples;
 
 	return result;
+}
+
+IndexBuildResult *
+turboquantbuild(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	IndexBuildResult *result;
+
+	if (HnswUseTqNativeGraph(index))
+		return tqgraphbuild(heap, index, indexInfo);
+
+	if (!HnswUseTqFlat(index))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant requires a native graph-compatible opclass"),
+				 errhint("Use the hnsw or ivfflat access method directly for this opclass.")));
+
+	HnswSetForceTurboquantIndex(true);
+	PG_TRY();
+	{
+		result = hnswbuild(heap, index, indexInfo);
+	}
+	PG_CATCH();
+	{
+		HnswSetForceTurboquantIndex(false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	HnswSetForceTurboquantIndex(false);
+
+	return result;
+}
+
+void
+turboquantbuildempty(Relation index)
+{
+	if (HnswUseTqNativeGraph(index))
+	{
+		tqgraphbuildempty(index);
+		return;
+	}
+
+	if (!HnswUseTqFlat(index))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant requires a native graph-compatible opclass"),
+				 errhint("Use the hnsw or ivfflat access method directly for this opclass.")));
+
+	hnswbuildempty(index);
 }
 
 /*

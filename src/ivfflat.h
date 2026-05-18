@@ -8,6 +8,7 @@
 #include "access/parallel.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
+#include "optimizer/cost.h"
 #include "port.h"				/* for random() */
 #include "storage/condition_variable.h"
 #include "utils/sampling.h"
@@ -342,6 +343,10 @@ bool		ivfflatinsert(Relation index, Datum *values, bool *isnull, ItemPointer hea
 );
 IndexBulkDeleteResult *ivfflatbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
 IndexBulkDeleteResult *ivfflatvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+void		ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+								 Cost *indexStartupCost, Cost *indexTotalCost,
+								 Selectivity *indexSelectivity, double *indexCorrelation,
+								 double *indexPages);
 IndexScanDesc ivfflatbeginscan(Relation index, int nkeys, int norderbys);
 void		ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		ivfflatgettuple(IndexScanDesc scan, ScanDirection dir);

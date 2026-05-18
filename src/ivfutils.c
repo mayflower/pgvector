@@ -6,6 +6,7 @@
 #include "halfutils.h"
 #include "halfvec.h"
 #include "ivfflat.h"
+#include "lib/stringinfo.h"
 #include "storage/bufmgr.h"
 #include "utils/relcache.h"
 #include "utils/varbit.h"
