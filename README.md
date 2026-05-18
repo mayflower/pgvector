@@ -667,10 +667,27 @@ FIQA retrieval benchmark with 57,638 `text-embedding-3-small` corpus vectors, 64
 
 | Method | Build ms | Index MB | p50 ms | p95 ms | p99 ms | nDCG@10 | qrels recall@10 | exact recall@10 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| TurboQuant graph, 4-bit | 44,076.171 | 455.258 | 1.271 | 2.705 | 5.462 | 0.4410 | 0.5163 | 0.9818 |
-| HNSW | 77,641.269 | 450.039 | 2.001 | 4.511 | 7.928 | 0.4438 | 0.5182 | 0.9914 |
+| TurboQuant graph, 4-bit, exact storage on | 35,762.322 | 393.453 | 0.644 | 0.764 | 0.853 | 0.4410 | 0.5163 | 0.9818 |
+| TurboQuant graph, 4-bit, exact storage off | 35,666.216 | 53.125 | 0.544 | 0.639 | 0.703 | 0.4420 | 0.5132 | 0.9463 |
+| HNSW | 201,022.266 | 450.039 | 1.745 | 2.948 | 3.733 | 0.4438 | 0.5182 | 0.9915 |
 
-On this run, TurboQuant graph builds 1.76x faster and improves p50/p95/p99 latency by 1.57x/1.67x/1.45x, with slightly lower retrieval quality than HNSW.
+With `tq_exact_storage = off`, TurboQuant omits the full-precision vector slab from the index and uses quantized-code ordering only. This makes the FIQA index 88.2% smaller than HNSW in this run, with lower exact recall@10 but similar qrels-based retrieval metrics.
+
+Full details are in [benchmark.md](benchmark.md).
+
+### ANN Benchmarks
+
+GloVe subset benchmark derived from `glove-100-angular` with 100,000 train vectors, 1,000 query vectors, 100 dimensions, cosine distance, exact top-10 ground truth, and `hnsw.ef_search = 64`.
+
+| Method | Recall@10 | Build s | Index MB | p50 ms | p95 ms | p99 ms | QPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TurboQuant graph, 4-bit, exact storage on | 0.8507 | 478.3 | 170.1 | 0.332 | 0.370 | 0.393 | 2993.2 |
+| TurboQuant graph, 4-bit, exact storage off | 0.7563 | 272.3 | 130.9 | 0.314 | 0.366 | 0.407 | 3145.4 |
+| HNSW | 0.8509 | 614.5 | 71.0 | 4.451 | 14.831 | 22.560 | 164.2 |
+
+This ANN run shows the current exact-free tradeoff more harshly than FIQA: it is the fastest variant and builds faster than exact-storage TurboQuant, but recall@10 drops from HNSW-equivalent quality to 0.7563. It also remains larger than HNSW on this 100-dimensional dataset, so exact-free storage is not a general compression win until graph/code page overhead is reduced further.
+
+Full details and larger-run boundary checks are in [benchmark2.md](benchmark2.md).
 
 ### Tuning
 

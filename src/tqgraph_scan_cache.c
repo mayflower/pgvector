@@ -74,15 +74,13 @@ TqGraphInitScanStorageUncached(HnswMetaPageData *meta, TqGraphScanStorage *stora
 												  meta->tqPayloadCount,
 												  meta->tqBits,
 												  (meta->tqFlags & TQ_GRAPH_TQ_WEIGHTED) != 0));
-	storage->adjTuplesPerPage = TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
 	storage->codePageCount = TqGraphPageCount(meta->tqNodeCount, storage->codeTuplesPerPage);
-	storage->adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), storage->adjTuplesPerPage);
+	storage->adjPageCount = BlockNumberIsValid(meta->tqAdjStartBlkno) ? 1 : 0;
 	storage->codePagesLoaded = palloc0(sizeof(bool) * storage->codePageCount);
-	storage->adjPagesLoaded = palloc0(sizeof(bool) * storage->adjPageCount);
+	if (storage->adjPageCount > 0)
+		storage->adjPagesLoaded = palloc0(sizeof(bool) * storage->adjPageCount);
 	storage->codeBlknos = palloc(sizeof(BlockNumber) * storage->codePageCount);
-	storage->adjBlknos = palloc(sizeof(BlockNumber) * storage->adjPageCount);
 	TqGraphInitBlockMap(storage->codeBlknos, storage->codePageCount);
-	TqGraphInitBlockMap(storage->adjBlknos, storage->adjPageCount);
 }
 
 bool
@@ -186,40 +184,25 @@ retry:
 	return storage->nodes[nodeId].loaded;
 }
 
-bool
-TqGraphLoadAdjPage(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
-				   TqGraphScanStorage *storage, uint32 nodeId, int level)
+static void
+TqGraphLoadAllAdjPages(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
+					   TqGraphScanStorage *storage)
 {
-	int			pageNo;
-	int			slot;
-	BlockNumber blkno;
+	BlockNumber blkno = meta->tqAdjStartBlkno;
+	BlockNumber nblocks;
 
-	if (nodeId >= meta->tqNodeCount || level < 0 || level > meta->graphMaxLevel ||
-		!BlockNumberIsValid(meta->tqAdjStartBlkno))
-		return false;
+	if (!BlockNumberIsValid(blkno) || storage->adjPageCount <= 0 ||
+		storage->adjPagesLoaded == NULL || storage->adjPagesLoaded[0])
+		return;
 
-	if (storage->cached)
-		return true;
-
-	slot = TqGraphAdjSlot(meta, nodeId, level);
-	pageNo = slot / storage->adjTuplesPerPage;
-	if (pageNo < 0 || pageNo >= storage->adjPageCount)
-		return false;
-
-	if (storage->adjPagesLoaded[pageNo])
-		return true;
-
-	blkno = TqGraphGetMappedBlockNumber(meta->tqAdjStartBlkno, pageNo,
-										 storage->adjBlknos);
-
+	nblocks = RelationGetNumberOfBlocks(index);
+	while (BlockNumberIsValid(blkno) && blkno < nblocks)
 	{
 		Buffer		buf;
 		Page		page;
 		HnswPageOpaque opaque;
 		OffsetNumber maxoff;
-		bool		fallbackTried = false;
-
-retry:
+		BlockNumber nextblkno;
 
 		CHECK_FOR_INTERRUPTS();
 		buf = ReadBuffer(index, blkno);
@@ -229,36 +212,37 @@ retry:
 		if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_ADJ)
 		{
 			UnlockReleaseBuffer(buf);
-			if (!fallbackTried)
-			{
-				fallbackTried = true;
-				if (!TqGraphResolveChainBlockNumber(index, meta->tqAdjStartBlkno,
-													 pageNo, storage->adjPageCount,
-													 HNSW_PAGE_KIND_TQ_ADJ,
-													 storage->adjBlknos, &blkno))
-					return false;
-				goto retry;
-			}
-			return false;
+			break;
 		}
 
 		if (so != NULL)
 			so->graphAdjPagesRead++;
+		nextblkno = opaque->nextblkno;
 		maxoff = PageGetMaxOffsetNumber(page);
 		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
 		{
 			ItemId		iid = PageGetItemId(page, offno);
-			TqGraphAdjTuple tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+			TqGraphAdjTuple tuple;
 			int			tupleSlot;
 
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
 			if (tuple->type != TQ_GRAPH_ADJ_TUPLE_TYPE ||
 				tuple->nodeId >= meta->tqNodeCount ||
 				tuple->level > meta->graphMaxLevel ||
+				tuple->level >= storage->levelCount ||
 				tuple->count > TqGraphLevelM(meta->m, tuple->level))
 				continue;
 
 			tupleSlot = TqGraphAdjSlot(meta, tuple->nodeId, tuple->level);
 			storage->neighborCounts[tupleSlot] = tuple->count;
+			if (storage->neighbors[tupleSlot] != NULL)
+			{
+				pfree(storage->neighbors[tupleSlot]);
+				storage->neighbors[tupleSlot] = NULL;
+			}
 			if (tuple->count > 0)
 			{
 				storage->neighbors[tupleSlot] = palloc(sizeof(uint32) * tuple->count);
@@ -266,10 +250,27 @@ retry:
 			}
 		}
 
-		storage->adjPagesLoaded[pageNo] = true;
 		UnlockReleaseBuffer(buf);
+		if (nextblkno == blkno)
+			break;
+		blkno = nextblkno;
 	}
 
+	storage->adjPagesLoaded[0] = true;
+}
+
+bool
+TqGraphLoadAdjPage(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
+				   TqGraphScanStorage *storage, uint32 nodeId, int level)
+{
+	if (nodeId >= meta->tqNodeCount || level < 0 || level > meta->graphMaxLevel ||
+		!BlockNumberIsValid(meta->tqAdjStartBlkno))
+		return false;
+
+	if (storage->cached)
+		return true;
+
+	TqGraphLoadAllAdjPages(index, so, meta, storage);
 	return true;
 }
 
@@ -527,17 +528,8 @@ TqGraphBuildCache(Relation index, HnswMetaPageData *meta)
 
 	TqGraphBuildPayloadRefs(meta, &cache->storage);
 
-	for (uint32 nodeId = 0; nodeId < meta->tqNodeCount; nodeId++)
-	{
-		int			maxLevel;
-
-		if (!cache->storage.nodes[nodeId].loaded)
-			continue;
-
-		maxLevel = Min(cache->storage.nodes[nodeId].level, (int) meta->graphMaxLevel);
-		for (int level = 0; level <= maxLevel; level++)
-			(void) TqGraphLoadAdjPage(index, NULL, meta, &cache->storage, nodeId, level);
-	}
+	if (meta->tqNodeCount > 0)
+		TqGraphLoadAllAdjPages(index, NULL, meta, &cache->storage);
 
 	if (cache->storage.exactArena != NULL)
 		(void) TqGraphLoadExactVectors(index, meta, &cache->storage);

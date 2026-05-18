@@ -1368,15 +1368,19 @@ TqGraphWriteAdjPages(TqGraphBuildState *state)
 	BlockNumber start = InvalidBlockNumber;
 	Size		maxTupleSize = TqGraphAdjTupleSize(TqGraphLevelM(state->m, 0));
 	TqGraphAdjTuple tuple = palloc0(maxTupleSize);
+	int			levelCapacity = TqGraphLevelCapacity(state->m);
 
 	for (uint32 i = 0; i < state->nodeCount; i++)
 	{
-		for (int level = 0; level < TqGraphLevelCapacity(state->m); level++)
-		{
-			TqGraphBuildNode *node = &state->nodes[i];
-			int			count = level <= node->level ? node->neighborCounts[level] : 0;
+		TqGraphBuildNode *node = &state->nodes[i];
+		int			maxLevel = Min(node->level, levelCapacity - 1);
 
-			if (!BufferIsValid(buf) || PageGetFreeSpace(page) < maxTupleSize)
+		for (int level = 0; level <= maxLevel; level++)
+		{
+			int			count = node->neighborCounts[level];
+			Size		tupleSize = TqGraphAdjTupleSize(TqGraphLevelM(state->m, level));
+
+			if (!BufferIsValid(buf) || PageGetFreeSpace(page) < tupleSize)
 			{
 				TqGraphAppendPage(state->index, state->forkNum, &buf, &page, HNSW_PAGE_KIND_TQ_ADJ);
 				if (!BlockNumberIsValid(start))
@@ -1391,7 +1395,7 @@ TqGraphWriteAdjPages(TqGraphBuildState *state)
 			for (int j = 0; j < count; j++)
 				tuple->neighbors[j] = node->neighbors[level][j];
 
-			if (PageAddItem(page, (Item) tuple, maxTupleSize, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+			if (PageAddItem(page, (Item) tuple, tupleSize, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 				elog(ERROR, "failed to add turboquant graph adjacency item to \"%s\"", RelationGetRelationName(state->index));
 			HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_INSERT);
 		}
@@ -3072,8 +3076,6 @@ static bool
 TqGraphRepairAdjacencyForDeadNodes(Relation index, HnswMetaPageData *meta,
 								   bool *deadNodes)
 {
-	int			adjTuplesPerPage;
-	int			adjPageCount;
 	int			levelCapacity;
 	bool		changedAny = false;
 	BlockNumber blkno;
@@ -3083,15 +3085,10 @@ TqGraphRepairAdjacencyForDeadNodes(Relation index, HnswMetaPageData *meta,
 		return false;
 
 	levelCapacity = TqGraphLevelCapacity(meta->m);
-	adjTuplesPerPage =
-		TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
-	adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), adjTuplesPerPage);
 	blkno = meta->tqAdjStartBlkno;
 	nblocks = RelationGetNumberOfBlocks(index);
 
-	for (int pageNo = 0;
-		 pageNo < adjPageCount && BlockNumberIsValid(blkno) && blkno < nblocks;
-		 pageNo++)
+	while (BlockNumberIsValid(blkno) && blkno < nblocks)
 	{
 		Buffer		buf;
 		Page		page;
@@ -3189,6 +3186,8 @@ TqGraphRepairAdjacencyForDeadNodes(Relation index, HnswMetaPageData *meta,
 			HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno, HNSW_GRAPH_OP_VACUUM_REPAIR);
 		}
 
+		if (nextblkno == blkno)
+			break;
 		blkno = nextblkno;
 	}
 
@@ -3203,8 +3202,6 @@ TqGraphCollectVacuumStats(Relation index, HnswMetaPageData *meta,
 	int			codeTuplesPerPage;
 	int			codePageCount;
 	int			tqBits = meta->tqBits != 0 ? meta->tqBits : TQ_DEFAULT_BITS;
-	int			adjTuplesPerPage;
-	int			adjPageCount;
 	int			levelCapacity;
 	bool	   *deadBitmap;
 	BlockNumber nblocks;
@@ -3284,19 +3281,15 @@ TqGraphCollectVacuumStats(Relation index, HnswMetaPageData *meta,
 	}
 
 	levelCapacity = TqGraphLevelCapacity(meta->m);
-	adjTuplesPerPage =
-		TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
-	adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), adjTuplesPerPage);
 	blkno = meta->tqAdjStartBlkno;
 
-	for (int pageNo = 0;
-		 pageNo < adjPageCount && BlockNumberIsValid(blkno) && blkno < nblocks;
-		 pageNo++)
+	while (BlockNumberIsValid(blkno) && blkno < nblocks)
 	{
 		Buffer		buf;
 		Page		page;
 		HnswPageOpaque opaque;
 		OffsetNumber maxoff;
+		BlockNumber nextblkno;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -3309,6 +3302,7 @@ TqGraphCollectVacuumStats(Relation index, HnswMetaPageData *meta,
 			UnlockReleaseBuffer(buf);
 			break;
 		}
+		nextblkno = opaque->nextblkno;
 
 		maxoff = PageGetMaxOffsetNumber(page);
 		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
@@ -3341,8 +3335,10 @@ TqGraphCollectVacuumStats(Relation index, HnswMetaPageData *meta,
 			}
 		}
 
-		blkno = opaque->nextblkno;
 		UnlockReleaseBuffer(buf);
+		if (nextblkno == blkno)
+			break;
+		blkno = nextblkno;
 	}
 
 	pfree(deadBitmap);

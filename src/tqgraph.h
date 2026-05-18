@@ -229,11 +229,9 @@ typedef struct TqGraphScanStorage
 	bool	   *codePagesLoaded;
 	bool	   *adjPagesLoaded;
 	BlockNumber *codeBlknos;
-	BlockNumber *adjBlknos;
 	TqGraphPayloadRef *payloadRefs;
 	uint32		payloadRefCount;
 	int			codeTuplesPerPage;
-	int			adjTuplesPerPage;
 	int			codePageCount;
 	int			adjPageCount;
 	int			levelCount;

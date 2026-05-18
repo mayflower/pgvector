@@ -6,6 +6,7 @@
 
 #include "access/generic_xlog.h"
 #include "catalog/pg_type_d.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
 #include "utils/rel.h"
@@ -116,50 +117,64 @@ static bool
 TqGraphLoadAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 					int level, uint32 *neighbors, int *count)
 {
-	int			slot;
-	int			pageNo;
-	int			adjTuplesPerPage;
-	int			adjPageCount;
-	BlockNumber blkno;
-	Buffer		buf;
-	Page		page;
-	OffsetNumber maxoff;
+	BlockNumber blkno = meta->tqAdjStartBlkno;
+	BlockNumber nblocks;
 	bool		found = false;
 
 	*count = 0;
 	if (nodeId >= meta->tqNodeCount || level < 0 ||
 		level >= TqGraphLevelCapacity(meta->m))
 		return false;
-
-	adjTuplesPerPage = TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
-	adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), adjTuplesPerPage);
-	slot = TqGraphAdjSlot(meta, nodeId, level);
-	pageNo = slot / adjTuplesPerPage;
-	blkno = TqGraphGetChainBlockNumber(index, meta->tqAdjStartBlkno, pageNo,
-										adjPageCount, HNSW_PAGE_KIND_TQ_ADJ);
 	if (!BlockNumberIsValid(blkno))
 		return false;
 
-	buf = ReadBuffer(index, blkno);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+	nblocks = RelationGetNumberOfBlocks(index);
+	while (BlockNumberIsValid(blkno) && blkno < nblocks)
 	{
-		ItemId		iid = PageGetItemId(page, offno);
-		TqGraphAdjTuple tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+		Buffer		buf;
+		Page		page;
+		HnswPageOpaque opaque;
+		OffsetNumber maxoff;
+		BlockNumber nextblkno;
 
-		if (tuple->type == TQ_GRAPH_ADJ_TUPLE_TYPE &&
-			tuple->nodeId == nodeId &&
-			tuple->level == level)
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		opaque = HnswPageGetOpaque(page);
+		if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_ADJ)
 		{
-			*count = tuple->count;
-			memcpy(neighbors, tuple->neighbors, sizeof(uint32) * tuple->count);
-			found = true;
+			UnlockReleaseBuffer(buf);
 			break;
 		}
+		nextblkno = opaque->nextblkno;
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+		{
+			ItemId		iid = PageGetItemId(page, offno);
+			TqGraphAdjTuple tuple;
+			int			maxNeighbors = TqGraphLevelM(meta->m, level);
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+			if (tuple->type == TQ_GRAPH_ADJ_TUPLE_TYPE &&
+				tuple->nodeId == nodeId &&
+				tuple->level == level)
+			{
+				*count = Min(tuple->count, maxNeighbors);
+				memcpy(neighbors, tuple->neighbors, sizeof(uint32) * *count);
+				found = true;
+				break;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+		if (found || nextblkno == blkno)
+			break;
+		blkno = nextblkno;
 	}
-	UnlockReleaseBuffer(buf);
 
 	return found;
 }
@@ -168,15 +183,8 @@ static void
 TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 					  int level, uint32 *neighbors, int count)
 {
-	int			slot;
-	int			pageNo;
-	int			adjTuplesPerPage;
-	int			adjPageCount;
-	BlockNumber blkno;
-	Buffer		buf;
-	Page		page;
-	OffsetNumber maxoff;
-	GenericXLogState *xlogState = NULL;
+	BlockNumber blkno = meta->tqAdjStartBlkno;
+	BlockNumber nblocks;
 	bool		found = false;
 
 	if (nodeId >= meta->tqNodeCount || level < 0 ||
@@ -184,53 +192,99 @@ TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 		count > TqGraphLevelM(meta->m, level))
 		elog(ERROR, "invalid turboquant graph adjacency update");
 
-	adjTuplesPerPage = TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
-	adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), adjTuplesPerPage);
-	slot = TqGraphAdjSlot(meta, nodeId, level);
-	pageNo = slot / adjTuplesPerPage;
-	blkno = TqGraphGetChainBlockNumber(index, meta->tqAdjStartBlkno, pageNo,
-										adjPageCount, HNSW_PAGE_KIND_TQ_ADJ);
 	if (!BlockNumberIsValid(blkno))
 		elog(ERROR, "missing turboquant graph adjacency page");
 
-	buf = ReadBuffer(index, blkno);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	if (RelationNeedsWAL(index))
+	nblocks = RelationGetNumberOfBlocks(index);
+	while (BlockNumberIsValid(blkno) && blkno < nblocks)
 	{
-		xlogState = GenericXLogStart(index);
-		page = GenericXLogRegisterBuffer(xlogState, buf, 0);
-	}
-	else
-		page = BufferGetPage(buf);
+		Buffer		buf;
+		Page		page;
+		HnswPageOpaque opaque;
+		OffsetNumber maxoff;
+		BlockNumber nextblkno;
+		GenericXLogState *xlogState = NULL;
 
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
-	{
-		ItemId		iid = PageGetItemId(page, offno);
-		TqGraphAdjTuple tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
-
-		if (tuple->type == TQ_GRAPH_ADJ_TUPLE_TYPE &&
-			tuple->nodeId == nodeId &&
-			tuple->level == level)
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		if (RelationNeedsWAL(index))
 		{
+			xlogState = GenericXLogStart(index);
+			page = GenericXLogRegisterBuffer(xlogState, buf, 0);
+		}
+		else
+			page = BufferGetPage(buf);
+
+		opaque = HnswPageGetOpaque(page);
+		if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_ADJ)
+		{
+			if (xlogState != NULL)
+				GenericXLogAbort(xlogState);
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		nextblkno = opaque->nextblkno;
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+		{
+			ItemId		iid = PageGetItemId(page, offno);
+			TqGraphAdjTuple tuple;
+			Size		tupleSize;
+			int			tupleCapacity;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+			if (tuple->type != TQ_GRAPH_ADJ_TUPLE_TYPE ||
+				tuple->nodeId != nodeId ||
+				tuple->level != level)
+				continue;
+
+			tupleSize = ItemIdGetLength(iid);
+			if (tupleSize < offsetof(TqGraphAdjTupleData, neighbors))
+				elog(ERROR, "corrupt turboquant graph adjacency tuple");
+			tupleCapacity = (tupleSize - offsetof(TqGraphAdjTupleData, neighbors)) /
+				sizeof(uint32);
+			if (count > tupleCapacity)
+				elog(ERROR, "turboquant graph adjacency tuple lacks update capacity");
+
 			tuple->count = count;
 			memcpy(tuple->neighbors, neighbors, sizeof(uint32) * count);
+			if (count < tupleCapacity)
+				memset(&tuple->neighbors[count], 0,
+					   sizeof(uint32) * (tupleCapacity - count));
 			HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
 			found = true;
 			break;
 		}
+
+		if (xlogState != NULL)
+		{
+			if (found)
+				GenericXLogFinish(xlogState);
+			else
+				GenericXLogAbort(xlogState);
+		}
+		else if (found)
+			MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+
+		if (found)
+		{
+			HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno,
+								  HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
+			break;
+		}
+		if (nextblkno == blkno)
+			break;
+		blkno = nextblkno;
 	}
 
 	if (!found)
 		elog(ERROR, "missing turboquant graph adjacency tuple");
-
-	if (xlogState != NULL)
-		GenericXLogFinish(xlogState);
-	else
-		MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
-
-	HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
 }
 
 static bool
@@ -506,15 +560,17 @@ TqGraphAppendInsertedAdj(Relation index, BlockNumber *adjStart, int m,
 						 uint32 nodeId, int nodeLevel, uint32 **selected,
 						 int *selectedCounts)
 {
-	Size		tupleSize = TqGraphAdjTupleSize(TqGraphLevelM(m, 0));
-	TqGraphAdjTuple tuple = palloc0(tupleSize);
+	Size		maxTupleSize = TqGraphAdjTupleSize(TqGraphLevelM(m, 0));
+	TqGraphAdjTuple tuple = palloc0(maxTupleSize);
+	int			maxLevel = Min(nodeLevel, TqGraphLevelCapacity(m) - 1);
 
-	for (int level = 0; level < TqGraphLevelCapacity(m); level++)
+	for (int level = 0; level <= maxLevel; level++)
 	{
 		BlockNumber adjBlkno;
-		int			count = level <= nodeLevel ? selectedCounts[level] : 0;
+		int			count = selectedCounts[level];
+		Size		tupleSize = TqGraphAdjTupleSize(TqGraphLevelM(m, level));
 
-		memset(tuple, 0, tupleSize);
+		memset(tuple, 0, maxTupleSize);
 		tuple->type = TQ_GRAPH_ADJ_TUPLE_TYPE;
 		tuple->level = level;
 		tuple->count = count;

@@ -382,7 +382,7 @@ HnswInit(void)
 					   "Opt into TurboQuant+ renormalization residual correction at encode time.  Replaces the per-vector pre-quantization L2 length with l2_length / centroid_norm so Dot/Cosine scoring corrects for centroid quantization noise.  Default off; only takes effect when ecShift/ecScale corrections are present (cosine/IP builds) and tq_weighted is on.",
 					   false, AccessExclusiveLock);
 	add_bool_reloption(tq_relopt_kind, "tq_exact_storage",
-					   "Store exact vectors in native TurboQuant graph indexes for final exact rescoring.",
+					   "Store exact vectors in native TurboQuant graph indexes for final exact rescoring. Set off for compact exact-free quantized-only storage.",
 					   true, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
