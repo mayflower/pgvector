@@ -193,6 +193,40 @@ BEGIN
 END
 $$;
 DROP TABLE tq;
+CREATE TABLE tq_default_dims (id int, val vector(3072));
+INSERT INTO tq_default_dims
+SELECT i, ARRAY(
+	SELECT sin(0.001 * (g + i * 17))::real
+	FROM generate_series(1, 3072) g
+)::vector(3072)
+FROM generate_series(1, 20) i;
+CREATE INDEX tq_default_dims_cos_idx ON tq_default_dims
+	USING turboquant (val vector_cosine_ops) WITH (routing = graph);
+DO $$
+DECLARE
+	query vector(3072);
+	row_count int;
+	stats jsonb;
+BEGIN
+	IF tq_index_stats('tq_default_dims_cos_idx'::regclass)->>'tq_plus' <> 'true' THEN
+		RAISE EXCEPTION 'expected tq_plus metadata for 3072-dimensional cosine index';
+	END IF;
+	SELECT ARRAY(
+		SELECT sin(0.001 * (g + 999))::real
+		FROM generate_series(1, 3072) g
+	)::vector(3072) INTO query;
+	SELECT count(*) INTO row_count
+	FROM (SELECT id FROM tq_default_dims ORDER BY val <=> query LIMIT 5) s;
+	IF row_count <> 5 THEN
+		RAISE EXCEPTION 'expected 3072-dimensional cosine graph rows';
+	END IF;
+	stats := tq_last_scan_stats();
+	IF stats->>'scan_orchestration' <> 'graph_native' THEN
+		RAISE EXCEPTION 'expected native graph scan for 3072-dimensional cosine index';
+	END IF;
+END
+$$;
+DROP TABLE tq_default_dims;
 CREATE TABLE tq (id int, val vector(1024));
 INSERT INTO tq
 SELECT i, ARRAY(

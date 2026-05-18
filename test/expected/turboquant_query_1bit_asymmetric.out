@@ -110,24 +110,27 @@ BEGIN
 END $$;
 -- Self-query: at id = 1, val <=> (val from id=1) should put id=1 first
 -- under both modes.
-SET hnsw.tq_query_1bit_asymmetric = on;
-SELECT id FROM tq_asym_data
-  ORDER BY val <=> (SELECT val FROM tq_asym_data WHERE id = 1)
-  LIMIT 1;
- id 
-----
- 21
-(1 row)
+DO $$
+DECLARE
+    top1 int;
+BEGIN
+    PERFORM set_config('hnsw.tq_query_1bit_asymmetric', 'on', false);
+    SELECT id INTO top1 FROM tq_asym_data
+      ORDER BY val <=> (SELECT val FROM tq_asym_data WHERE id = 1)
+      LIMIT 1;
+    IF top1 <> 1 THEN
+        RAISE EXCEPTION 'asymmetric self-query returned %, expected 1', top1;
+    END IF;
 
+    PERFORM set_config('hnsw.tq_query_1bit_asymmetric', 'off', false);
+    SELECT id INTO top1 FROM tq_asym_data
+      ORDER BY val <=> (SELECT val FROM tq_asym_data WHERE id = 1)
+      LIMIT 1;
+    IF top1 <> 1 THEN
+        RAISE EXCEPTION 'symmetric self-query returned %, expected 1', top1;
+    END IF;
+END $$;
 RESET hnsw.tq_query_1bit_asymmetric;
-SELECT id FROM tq_asym_data
-  ORDER BY val <=> (SELECT val FROM tq_asym_data WHERE id = 1)
-  LIMIT 1;
- id 
-----
- 21
-(1 row)
-
 DROP INDEX tq_asym_idx;
 RESET hnsw.tq_graph_lowbit_popcnt;
 -- Default-off path: the GUC is off-by-default and a fresh build

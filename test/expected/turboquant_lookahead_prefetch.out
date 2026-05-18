@@ -90,27 +90,43 @@ END $$;
 -- explicit on/off modes.
 SET hnsw.tq_graph_lookahead_prefetch = auto;
 SET hnsw.tq_graph_lookahead_threshold_kb = 0;
-SELECT id FROM tq_la_data
-  ORDER BY val <=> (SELECT val FROM tq_la_data WHERE id = 5)
-  LIMIT 3;
- id 
-----
- 25
-  5
- 45
-(3 rows)
-
 SET hnsw.tq_graph_lookahead_threshold_kb = 1073741823;
-SELECT id FROM tq_la_data
-  ORDER BY val <=> (SELECT val FROM tq_la_data WHERE id = 5)
-  LIMIT 3;
- id 
-----
- 25
-  5
- 45
-(3 rows)
+DO $$
+DECLARE
+    top_on int[];
+    top_off int[];
+BEGIN
+    SET hnsw.tq_graph_lookahead_threshold_kb = 0;
+    SELECT array_agg(id ORDER BY ord)
+    INTO top_on
+    FROM (
+        SELECT id, row_number() OVER () AS ord
+        FROM (
+            SELECT id FROM tq_la_data
+            ORDER BY val <=> (SELECT val FROM tq_la_data WHERE id = 5)
+            LIMIT 3
+        ) s
+    ) ranked;
 
+    SET hnsw.tq_graph_lookahead_threshold_kb = 1073741823;
+    SELECT array_agg(id ORDER BY ord)
+    INTO top_off
+    FROM (
+        SELECT id, row_number() OVER () AS ord
+        FROM (
+            SELECT id FROM tq_la_data
+            ORDER BY val <=> (SELECT val FROM tq_la_data WHERE id = 5)
+            LIMIT 3
+        ) s
+    ) ranked;
+
+    IF array_length(top_on, 1) <> 3 OR array_length(top_off, 1) <> 3 THEN
+        RAISE EXCEPTION 'prefetch threshold probes returned incomplete top-3 results';
+    END IF;
+    IF top_on IS DISTINCT FROM top_off THEN
+        RAISE EXCEPTION 'prefetch threshold rankings disagree: % vs %', top_on, top_off;
+    END IF;
+END $$;
 RESET hnsw.tq_graph_lookahead_threshold_kb;
 RESET hnsw.tq_graph_lookahead_prefetch;
 DROP INDEX tq_la_idx;

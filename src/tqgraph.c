@@ -151,9 +151,19 @@ TqGraphCorrectionTupleSize(int count)
 					(sizeof(float) * count));
 }
 
+static int
+TqGraphCorrectionTupleMaxCount(void)
+{
+	Size		usable = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) -
+		MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData);
+	int			count = (usable - offsetof(TqGraphCorrectionTupleData, values)) /
+		sizeof(float);
 
+	while (count > 1 && TqGraphCorrectionTupleSize(count) > usable)
+		count--;
 
-
+	return Max(1, count);
+}
 
 static bool
 TqGraphBuildNodeHasLevel(TqGraphBuildState *state, uint32 nodeId, int level)
@@ -1399,38 +1409,46 @@ TqGraphWriteCorrectionPages(TqGraphBuildState *state)
 	Buffer		buf = InvalidBuffer;
 	Page		page = NULL;
 	BlockNumber start = InvalidBlockNumber;
-	Size		tupleSize;
+	Size		maxTupleSize;
 	TqGraphCorrectionTuple tuple;
+	int			maxValues;
 
 	if (state->nodeCount == 0 || state->dimensions <= 0 ||
 		state->ecShift == NULL || state->ecScale == NULL)
 		return InvalidBlockNumber;
 
-	tupleSize = TqGraphCorrectionTupleSize(state->dimensions);
-	tuple = palloc0(tupleSize);
+	maxValues = TqGraphCorrectionTupleMaxCount();
+	maxTupleSize = TqGraphCorrectionTupleSize(maxValues);
+	tuple = palloc0(maxTupleSize);
 
 	for (int field = 0; field < 2; field++)
 	{
 		const float *values = field == 0 ? state->ecShift : state->ecScale;
 
-		if (!BufferIsValid(buf) || PageGetFreeSpace(page) < tupleSize)
+		for (int startDim = 0; startDim < state->dimensions; startDim += maxValues)
 		{
-			TqGraphAppendPage(state->index, state->forkNum, &buf, &page,
-							  HNSW_PAGE_KIND_TQ_CORRECTION);
-			if (!BlockNumberIsValid(start))
-				start = BufferGetBlockNumber(buf);
+			int			count = Min(maxValues, state->dimensions - startDim);
+			Size		tupleSize = TqGraphCorrectionTupleSize(count);
+
+			if (!BufferIsValid(buf) || PageGetFreeSpace(page) < tupleSize)
+			{
+				TqGraphAppendPage(state->index, state->forkNum, &buf, &page,
+								  HNSW_PAGE_KIND_TQ_CORRECTION);
+				if (!BlockNumberIsValid(start))
+					start = BufferGetBlockNumber(buf);
+			}
+
+			memset(tuple, 0, maxTupleSize);
+			tuple->type = TQ_GRAPH_CORRECTION_TUPLE_TYPE;
+			tuple->field = field;
+			tuple->count = count;
+			tuple->startDim = startDim;
+			memcpy(tuple->values, values + startDim, sizeof(float) * count);
+
+			if (PageAddItem(page, (Item) tuple, tupleSize, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "failed to add turboquant graph correction item to \"%s\"", RelationGetRelationName(state->index));
+			HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_ELEMENT_INSERT);
 		}
-
-		memset(tuple, 0, tupleSize);
-		tuple->type = TQ_GRAPH_CORRECTION_TUPLE_TYPE;
-		tuple->field = field;
-		tuple->count = state->dimensions;
-		tuple->startDim = 0;
-		memcpy(tuple->values, values, sizeof(float) * state->dimensions);
-
-		if (PageAddItem(page, (Item) tuple, tupleSize, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-			elog(ERROR, "failed to add turboquant graph correction item to \"%s\"", RelationGetRelationName(state->index));
-		HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_ELEMENT_INSERT);
 	}
 
 	if (BufferIsValid(buf))

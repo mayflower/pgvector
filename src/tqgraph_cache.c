@@ -17,8 +17,10 @@ TqGraphLoadCorrection(Relation index, int dimensions, float **ecShift, float **e
 	HnswMetaPageData meta;
 	BlockNumber blkno;
 	BlockNumber nblocks;
-	bool		haveShift = false;
-	bool		haveScale = false;
+	bool	   *shiftSeen;
+	bool	   *scaleSeen;
+	int			shiftMissing = dimensions;
+	int			scaleMissing = dimensions;
 	int			hops = 0;
 	TqGraphCorrectionCache *cache;
 
@@ -47,8 +49,10 @@ TqGraphLoadCorrection(Relation index, int dimensions, float **ecShift, float **e
 		}
 	}
 
-	*ecShift = palloc(sizeof(float) * dimensions);
-	*ecScale = palloc(sizeof(float) * dimensions);
+	*ecShift = palloc0(sizeof(float) * dimensions);
+	*ecScale = palloc0(sizeof(float) * dimensions);
+	shiftSeen = palloc0(sizeof(bool) * dimensions);
+	scaleSeen = palloc0(sizeof(bool) * dimensions);
 	blkno = meta.tqCorrectionStartBlkno;
 	nblocks = RelationGetNumberOfBlocks(index);
 
@@ -74,29 +78,57 @@ TqGraphLoadCorrection(Relation index, int dimensions, float **ecShift, float **e
 		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
 		{
 			ItemId		iid = PageGetItemId(page, offno);
-			TqGraphCorrectionTuple tuple = (TqGraphCorrectionTuple) PageGetItem(page, iid);
+			TqGraphCorrectionTuple tuple;
+			float	   *target;
+			bool	   *seen;
+			int		   *missing;
+			uint32		startDim;
+			uint16		count;
 
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphCorrectionTuple) PageGetItem(page, iid);
 			if (tuple->type != TQ_GRAPH_CORRECTION_TUPLE_TYPE ||
-				tuple->startDim != 0 ||
-				tuple->count != dimensions)
+				(tuple->field != 0 && tuple->field != 1))
+				continue;
+
+			startDim = tuple->startDim;
+			count = tuple->count;
+			if (count == 0 || startDim >= (uint32) dimensions ||
+				count > (uint32) dimensions - startDim)
 				continue;
 
 			if (tuple->field == 0)
 			{
-				memcpy(*ecShift, tuple->values, sizeof(float) * dimensions);
-				haveShift = true;
+				target = *ecShift;
+				seen = shiftSeen;
+				missing = &shiftMissing;
 			}
-			else if (tuple->field == 1)
+			else
 			{
-				memcpy(*ecScale, tuple->values, sizeof(float) * dimensions);
-				haveScale = true;
+				target = *ecScale;
+				seen = scaleSeen;
+				missing = &scaleMissing;
+			}
+
+			memcpy(target + startDim, tuple->values, sizeof(float) * count);
+			for (int dim = 0; dim < count; dim++)
+			{
+				int			offset = startDim + dim;
+
+				if (!seen[offset])
+				{
+					seen[offset] = true;
+					(*missing)--;
+				}
 			}
 		}
 
 		blkno = opaque->nextblkno;
 		UnlockReleaseBuffer(buf);
 
-		if (haveShift && haveScale)
+		if (shiftMissing == 0 && scaleMissing == 0)
 		{
 			MemoryContext oldCtx;
 
@@ -118,10 +150,14 @@ TqGraphLoadCorrection(Relation index, int dimensions, float **ecShift, float **e
 			MemoryContextSwitchTo(oldCtx);
 			cache->next = tqGraphCorrectionCacheList;
 			tqGraphCorrectionCacheList = cache;
+			pfree(shiftSeen);
+			pfree(scaleSeen);
 			return true;
 		}
 	}
 
+	pfree(shiftSeen);
+	pfree(scaleSeen);
 	pfree(*ecShift);
 	pfree(*ecScale);
 	*ecShift = NULL;

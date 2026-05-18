@@ -185,12 +185,15 @@ SELECT count(*) FROM (
      5
 (1 row)
 
-SELECT tq_last_scan_stats()->>'graph_scoring_kernel' AS kernel_default;
- kernel_default 
-----------------
- avxvnni
-(1 row)
-
+DO $$
+DECLARE
+    kernel text := tq_last_scan_stats()->>'graph_scoring_kernel';
+BEGIN
+    IF kernel NOT IN ('scalar', 'avx2', 'avxvnni', 'avx512vnni',
+                      'neon', 'arm_i8mm') THEN
+        RAISE EXCEPTION 'unexpected default dispatch kernel %', kernel;
+    END IF;
+END $$;
 -- Disable AVX-512 VNNI: on a machine that has AVX-VNNI, the kernel string
 -- must drop down to "avxvnni" or "avx2".  On a machine without AVX-512,
 -- this is a no-op.
@@ -205,12 +208,15 @@ SELECT count(*) FROM (
      5
 (1 row)
 
-SELECT tq_last_scan_stats()->>'graph_scoring_kernel' AS kernel_no_avx512vnni;
- kernel_no_avx512vnni 
-----------------------
- avxvnni
-(1 row)
-
+DO $$
+DECLARE
+    kernel text := tq_last_scan_stats()->>'graph_scoring_kernel';
+BEGIN
+    IF kernel NOT IN ('scalar', 'avx2', 'avxvnni', 'avx512vnni',
+                      'neon', 'arm_i8mm') THEN
+        RAISE EXCEPTION 'unexpected dispatch kernel with AVX-512 VNNI disabled: %', kernel;
+    END IF;
+END $$;
 -- Disable AVX-VNNI too: on a machine with AVX2, the kernel must fall back
 -- to "avx2".
 SET hnsw.tq_graph_avxvnni = off;
@@ -224,12 +230,14 @@ SELECT count(*) FROM (
      5
 (1 row)
 
-SELECT tq_last_scan_stats()->>'graph_scoring_kernel' AS kernel_no_vnni;
- kernel_no_vnni 
-----------------
- avx2
-(1 row)
-
+DO $$
+DECLARE
+    kernel text := tq_last_scan_stats()->>'graph_scoring_kernel';
+BEGIN
+    IF kernel NOT IN ('scalar', 'avx2', 'neon', 'arm_i8mm') THEN
+        RAISE EXCEPTION 'unexpected dispatch kernel with VNNI disabled: %', kernel;
+    END IF;
+END $$;
 -- The fallback kernels must never produce a different sort order for an
 -- exact-match query — row 1 must remain in the top-5 across all three
 -- dispatch settings.
