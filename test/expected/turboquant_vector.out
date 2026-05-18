@@ -449,15 +449,34 @@ DELETE FROM tq_vacuum_chain WHERE id >= 11;
 VACUUM tq_vacuum_chain;
 DO $$
 DECLARE
+	stats jsonb;
 	vacuum_pages int;
+	repair_pages int;
+	live_nodes int;
+	dead_nodes int;
+	dead_neighbor_refs int;
 BEGIN
-	SELECT ((tq_index_stats('tq_vacuum_chain_idx'::regclass)
-		-> 'graph_page_last_op_counts' ->> 'vacuum_delete')::int)
-	INTO vacuum_pages;
+	stats := tq_index_stats('tq_vacuum_chain_idx'::regclass);
+	vacuum_pages := (stats -> 'graph_page_last_op_counts' ->> 'vacuum_delete')::int;
+	repair_pages := (stats -> 'graph_page_last_op_counts' ->> 'vacuum_repair')::int;
+	live_nodes := (stats ->> 'tq_live_node_count')::int;
+	dead_nodes := (stats ->> 'tq_dead_node_count')::int;
+	dead_neighbor_refs := (stats ->> 'graph_dead_neighbor_refs')::int;
 
 	IF vacuum_pages < 2 THEN
 		RAISE EXCEPTION 'expected vacuum to follow linked TurboQuant code pages, got % pages',
 			vacuum_pages;
+	END IF;
+	IF repair_pages < 1 THEN
+		RAISE EXCEPTION 'expected vacuum to repair TurboQuant adjacency pages';
+	END IF;
+	IF live_nodes <> 10 OR dead_nodes <> 30 THEN
+		RAISE EXCEPTION 'expected 10 live and 30 dead TurboQuant nodes, got live %, dead %',
+			live_nodes, dead_nodes;
+	END IF;
+	IF dead_neighbor_refs <> 0 THEN
+		RAISE EXCEPTION 'expected vacuum to remove dead TurboQuant adjacency refs, got %',
+			dead_neighbor_refs;
 	END IF;
 END
 $$;

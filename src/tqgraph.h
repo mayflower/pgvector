@@ -453,6 +453,10 @@ bool		TqGraphLoadAdjPage(Relation index, HnswScanOpaque so,
 							   HnswMetaPageData *meta,
 							   TqGraphScanStorage *storage,
 							   uint32 nodeId, int level);
+void		TqGraphCollectVacuumStats(Relation index, HnswMetaPageData *meta,
+									  int64 *liveNodes, int64 *deadNodes,
+									  int64 *adjacencyRefs,
+									  int64 *deadNeighborRefs);
 bool		TqGraphPayloadRefRange(TqGraphScanStorage *storage, int payloadSlot,
 								   int32 payloadValue, uint32 *firstIndex,
 								   uint32 *refCount);

@@ -35,6 +35,7 @@
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 #include "vector.h"
+#include "tqgraph.h"
 
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
@@ -793,6 +794,7 @@ tq_index_stats(PG_FUNCTION_ARGS)
 	uint16		tqFlags;
 	uint16		tqBits;
 	BlockNumber tqCorrectionStartBlkno;
+	HnswMetaPageData metaSnapshot;
 	int16		entryLevel;
 	uint16		metaPageKind;
 	uint16		metaLastGraphOp;
@@ -802,6 +804,10 @@ tq_index_stats(PG_FUNCTION_ARGS)
 	int64		graphTaggedPageCount = 0;
 	int64		graphUnknownLastOpCount = 0;
 	int64		graphLastOpCounts[TQ_GRAPH_OP_COUNT] = {0};
+	int64		tqLiveNodeCount = 0;
+	int64		tqDeadNodeCount = 0;
+	int64		graphAdjacencyRefCount = 0;
+	int64		graphDeadNeighborRefCount = 0;
 	StringInfoData json;
 
 	index = index_open(indexOid, AccessShareLock);
@@ -816,6 +822,7 @@ tq_index_stats(PG_FUNCTION_ARGS)
 	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
 		elog(ERROR, "hnsw index is not valid");
 
+	metaSnapshot = *metap;
 	storageKind = metap->storageKind;
 	graphM = metap->m;
 	graphEfConstruction = metap->efConstruction;
@@ -871,6 +878,13 @@ tq_index_stats(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buf);
 	}
 
+	if (storageKind == HNSW_STORAGE_TURBOQUANT_GRAPH_NATIVE)
+		TqGraphCollectVacuumStats(index, &metaSnapshot,
+								  &tqLiveNodeCount,
+								  &tqDeadNodeCount,
+								  &graphAdjacencyRefCount,
+								  &graphDeadNeighborRefCount);
+
 	initStringInfo(&json);
 	appendStringInfo(&json,
 					 "{\"storage_kind\":\"%s\","
@@ -892,6 +906,10 @@ tq_index_stats(PG_FUNCTION_ARGS)
 					 "\"first_graph_last_graph_op\":%u,"
 					 "\"graph_page_count\":" INT64_FORMAT ","
 					 "\"graph_tagged_page_count\":" INT64_FORMAT ","
+					 "\"tq_live_node_count\":" INT64_FORMAT ","
+					 "\"tq_dead_node_count\":" INT64_FORMAT ","
+					 "\"graph_adjacency_ref_count\":" INT64_FORMAT ","
+					 "\"graph_dead_neighbor_refs\":" INT64_FORMAT ","
 					 "\"graph_page_last_op_counts\":{"
 					 "\"none\":" INT64_FORMAT ","
 					 "\"page_init\":" INT64_FORMAT ","
@@ -926,6 +944,10 @@ tq_index_stats(PG_FUNCTION_ARGS)
 					 firstGraphLastGraphOp,
 					 graphPageCount,
 					 graphTaggedPageCount,
+					 tqLiveNodeCount,
+					 tqDeadNodeCount,
+					 graphAdjacencyRefCount,
+					 graphDeadNeighborRefCount,
 					 graphLastOpCounts[HNSW_GRAPH_OP_NONE],
 					 graphLastOpCounts[HNSW_GRAPH_OP_PAGE_INIT],
 					 graphLastOpCounts[HNSW_GRAPH_OP_PAGE_LINK],

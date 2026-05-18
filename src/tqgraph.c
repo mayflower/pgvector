@@ -3024,6 +3024,286 @@ tqgraphinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	return true;
 }
 
+static bool
+TqGraphRepairAdjacencyForDeadNodes(Relation index, HnswMetaPageData *meta,
+								   bool *deadNodes)
+{
+	int			adjTuplesPerPage;
+	int			adjPageCount;
+	int			levelCapacity;
+	bool		changedAny = false;
+	BlockNumber blkno;
+	BlockNumber nblocks;
+
+	if (!BlockNumberIsValid(meta->tqAdjStartBlkno) || deadNodes == NULL)
+		return false;
+
+	levelCapacity = TqGraphLevelCapacity(meta->m);
+	adjTuplesPerPage =
+		TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
+	adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), adjTuplesPerPage);
+	blkno = meta->tqAdjStartBlkno;
+	nblocks = RelationGetNumberOfBlocks(index);
+
+	for (int pageNo = 0;
+		 pageNo < adjPageCount && BlockNumberIsValid(blkno) && blkno < nblocks;
+		 pageNo++)
+	{
+		Buffer		buf;
+		Page		page;
+		HnswPageOpaque opaque;
+		BlockNumber nextblkno;
+		OffsetNumber maxoff;
+		bool		changed = false;
+		GenericXLogState *xlogState = NULL;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+		if (RelationNeedsWAL(index))
+		{
+			xlogState = GenericXLogStart(index);
+			page = GenericXLogRegisterBuffer(xlogState, buf, 0);
+		}
+		else
+			page = BufferGetPage(buf);
+
+		opaque = HnswPageGetOpaque(page);
+		if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_ADJ)
+		{
+			if (xlogState != NULL)
+				GenericXLogAbort(xlogState);
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		nextblkno = opaque->nextblkno;
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+		{
+			ItemId		iid = PageGetItemId(page, offno);
+			TqGraphAdjTuple tuple;
+			uint16		maxNeighbors;
+			uint16		oldCount;
+			uint16		scanCount;
+			uint16		newCount = 0;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+			if (tuple->type != TQ_GRAPH_ADJ_TUPLE_TYPE ||
+				tuple->nodeId >= meta->tqNodeCount ||
+				tuple->level >= levelCapacity)
+				continue;
+
+			maxNeighbors = TqGraphLevelM(meta->m, tuple->level);
+			oldCount = tuple->count;
+			scanCount = Min(oldCount, maxNeighbors);
+
+			if (!deadNodes[tuple->nodeId])
+			{
+				for (int i = 0; i < scanCount; i++)
+				{
+					uint32		neighbor = tuple->neighbors[i];
+
+					if (neighbor < meta->tqNodeCount && !deadNodes[neighbor])
+						tuple->neighbors[newCount++] = neighbor;
+				}
+			}
+
+			if (newCount != oldCount)
+			{
+				if (newCount < scanCount)
+					memset(&tuple->neighbors[newCount], 0,
+						   sizeof(uint32) * (scanCount - newCount));
+				tuple->count = newCount;
+				changed = true;
+			}
+		}
+
+		if (changed)
+			HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_VACUUM_REPAIR);
+
+		if (xlogState != NULL)
+		{
+			if (changed)
+				GenericXLogFinish(xlogState);
+			else
+				GenericXLogAbort(xlogState);
+		}
+		else if (changed)
+			MarkBufferDirty(buf);
+
+		UnlockReleaseBuffer(buf);
+
+		if (changed)
+		{
+			changedAny = true;
+			HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno, HNSW_GRAPH_OP_VACUUM_REPAIR);
+		}
+
+		blkno = nextblkno;
+	}
+
+	return changedAny;
+}
+
+void
+TqGraphCollectVacuumStats(Relation index, HnswMetaPageData *meta,
+						  int64 *liveNodes, int64 *deadNodes,
+						  int64 *adjacencyRefs, int64 *deadNeighborRefs)
+{
+	int			codeTuplesPerPage;
+	int			codePageCount;
+	int			tqBits = meta->tqBits != 0 ? meta->tqBits : TQ_DEFAULT_BITS;
+	int			adjTuplesPerPage;
+	int			adjPageCount;
+	int			levelCapacity;
+	bool	   *deadBitmap;
+	BlockNumber nblocks;
+	BlockNumber blkno;
+
+	*liveNodes = 0;
+	*deadNodes = 0;
+	*adjacencyRefs = 0;
+	*deadNeighborRefs = 0;
+
+	if (meta->tqNodeCount == 0 ||
+		!BlockNumberIsValid(meta->tqCodeStartBlkno))
+		return;
+
+	deadBitmap = palloc0(sizeof(bool) * meta->tqNodeCount);
+	nblocks = RelationGetNumberOfBlocks(index);
+	codeTuplesPerPage =
+		TqGraphTuplesPerPage(TqGraphCodeTupleSize(meta->dimensions,
+												  meta->tqPayloadCount,
+												  tqBits,
+												  (meta->tqFlags & TQ_GRAPH_TQ_WEIGHTED) != 0));
+	codePageCount = TqGraphPageCount(meta->tqNodeCount, codeTuplesPerPage);
+	blkno = meta->tqCodeStartBlkno;
+
+	for (int pageNo = 0;
+		 pageNo < codePageCount && BlockNumberIsValid(blkno) && blkno < nblocks;
+		 pageNo++)
+	{
+		Buffer		buf;
+		Page		page;
+		HnswPageOpaque opaque;
+		OffsetNumber maxoff;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		opaque = HnswPageGetOpaque(page);
+		if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_CODE)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+		{
+			ItemId		iid = PageGetItemId(page, offno);
+			TqGraphCodeTuple tuple;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphCodeTuple) PageGetItem(page, iid);
+			if (tuple->type != TQ_GRAPH_CODE_TUPLE_TYPE ||
+				tuple->nodeId >= meta->tqNodeCount)
+				continue;
+
+			if (tuple->flags & TQ_GRAPH_NODE_DEAD)
+			{
+				deadBitmap[tuple->nodeId] = true;
+				(*deadNodes)++;
+			}
+			else
+				(*liveNodes)++;
+		}
+
+		blkno = opaque->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (!BlockNumberIsValid(meta->tqAdjStartBlkno))
+	{
+		pfree(deadBitmap);
+		return;
+	}
+
+	levelCapacity = TqGraphLevelCapacity(meta->m);
+	adjTuplesPerPage =
+		TqGraphTuplesPerPage(TqGraphAdjTupleSize(TqGraphLevelM(meta->m, 0)));
+	adjPageCount = TqGraphPageCount(TqGraphAdjRecordCount(meta), adjTuplesPerPage);
+	blkno = meta->tqAdjStartBlkno;
+
+	for (int pageNo = 0;
+		 pageNo < adjPageCount && BlockNumberIsValid(blkno) && blkno < nblocks;
+		 pageNo++)
+	{
+		Buffer		buf;
+		Page		page;
+		HnswPageOpaque opaque;
+		OffsetNumber maxoff;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		opaque = HnswPageGetOpaque(page);
+		if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_ADJ)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
+		{
+			ItemId		iid = PageGetItemId(page, offno);
+			TqGraphAdjTuple tuple;
+			uint16		maxNeighbors;
+			bool		deadSource;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+			if (tuple->type != TQ_GRAPH_ADJ_TUPLE_TYPE ||
+				tuple->nodeId >= meta->tqNodeCount ||
+				tuple->level >= levelCapacity)
+				continue;
+
+			maxNeighbors = TqGraphLevelM(meta->m, tuple->level);
+			deadSource = deadBitmap[tuple->nodeId];
+
+			for (int i = 0; i < Min(tuple->count, maxNeighbors); i++)
+			{
+				uint32		neighbor = tuple->neighbors[i];
+
+				(*adjacencyRefs)++;
+				if (deadSource || neighbor >= meta->tqNodeCount ||
+					deadBitmap[neighbor])
+					(*deadNeighborRefs)++;
+			}
+		}
+
+		blkno = opaque->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+
+	pfree(deadBitmap);
+}
+
 IndexBulkDeleteResult *
 tqgraphbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				  IndexBulkDeleteCallback callback, void *callback_state)
@@ -3032,8 +3312,12 @@ tqgraphbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	HnswMetaPageData meta;
 	int			codeTuplesPerPage;
 	int			codePageCount;
+	int			tqBits;
 	double		liveTuples = 0;
 	bool		changedAny = false;
+	bool		repairAny = false;
+	bool		hasDeadNodes = false;
+	bool	   *deadNodes = NULL;
 
 	if (stats == NULL)
 		stats = palloc0(sizeof(IndexBulkDeleteResult));
@@ -3043,12 +3327,14 @@ tqgraphbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		!BlockNumberIsValid(meta.tqCodeStartBlkno))
 		return stats;
 
+	tqBits = meta.tqBits != 0 ? meta.tqBits : TQ_DEFAULT_BITS;
 	codeTuplesPerPage =
 		TqGraphTuplesPerPage(TqGraphCodeTupleSize(meta.dimensions,
 												  meta.tqPayloadCount,
-												  meta.tqBits,
+												  tqBits,
 												  (meta.tqFlags & TQ_GRAPH_TQ_WEIGHTED) != 0));
 	codePageCount = TqGraphPageCount(meta.tqNodeCount, codeTuplesPerPage);
+	deadNodes = palloc0(sizeof(bool) * meta.tqNodeCount);
 
 	LockPage(index, HNSW_SCAN_LOCK, ExclusiveLock);
 	PG_TRY();
@@ -3102,13 +3388,21 @@ tqgraphbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 				tuple = (TqGraphCodeTuple) PageGetItem(page, iid);
 				if (tuple->type != TQ_GRAPH_CODE_TUPLE_TYPE ||
-					tuple->nodeId >= meta.tqNodeCount ||
-					(tuple->flags & TQ_GRAPH_NODE_DEAD))
+					tuple->nodeId >= meta.tqNodeCount)
 					continue;
+
+				if (tuple->flags & TQ_GRAPH_NODE_DEAD)
+				{
+					deadNodes[tuple->nodeId] = true;
+					hasDeadNodes = true;
+					continue;
+				}
 
 				if (callback(&tuple->heaptid, callback_state))
 				{
 					tuple->flags |= TQ_GRAPH_NODE_DEAD;
+					deadNodes[tuple->nodeId] = true;
+					hasDeadNodes = true;
 					stats->tuples_removed += 1;
 					changed = true;
 				}
@@ -3135,7 +3429,10 @@ tqgraphbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			blkno = nextblkno;
 		}
 
-		if (changedAny)
+		if (hasDeadNodes)
+			repairAny = TqGraphRepairAdjacencyForDeadNodes(index, &meta, deadNodes);
+
+		if (changedAny || repairAny)
 			TqGraphBumpMetaGeneration(index);
 	}
 	PG_CATCH();
@@ -3145,6 +3442,7 @@ tqgraphbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	}
 	PG_END_TRY();
 	UnlockPage(index, HNSW_SCAN_LOCK, ExclusiveLock);
+	pfree(deadNodes);
 
 	stats->num_index_tuples = liveTuples;
 	stats->estimated_count = false;
