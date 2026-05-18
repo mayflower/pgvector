@@ -1259,6 +1259,8 @@ TqGraphUpdateMetaPage(Relation index, TqGraphBuildState *state,
 		metap->tqFlags |= TQ_GRAPH_TQ_WEIGHTED;
 	if (state->tqRenorm)
 		metap->tqFlags |= TQ_GRAPH_TQ_RENORM;
+	if (!state->tqExactStorage)
+		metap->tqFlags |= TQ_GRAPH_EXACT_FREE;
 	metap->tqBits = state->tqBits != 0 ? state->tqBits : TQ_DEFAULT_BITS;
 	metap->tqCodeStartBlkno = codeStart;
 	metap->tqAdjStartBlkno = adjStart;
@@ -1472,7 +1474,17 @@ TqGraphWriteGraphDataPages(TqGraphBuildState *state, BlockNumber *codeStart,
 		return;
 	}
 
-	*exactStart = TqGraphWriteExactPages(state);
+	if (state->tqExactStorage)
+		*exactStart = TqGraphWriteExactPages(state);
+	else
+	{
+		*exactStart = InvalidBlockNumber;
+		for (uint32 i = 0; i < state->nodeCount; i++)
+		{
+			state->nodes[i].exactBlkno = InvalidBlockNumber;
+			state->nodes[i].exactOffno = InvalidOffsetNumber;
+		}
+	}
 	*correctionStart = TqGraphWriteCorrectionPages(state);
 	*codeStart = TqGraphWriteCodePages(state);
 	*adjStart = TqGraphWriteAdjPages(state);
@@ -1555,6 +1567,7 @@ tqgraphbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	state.tqWeighted = HnswGetTqWeightedOption(index);
 	state.tqQuantileFit = HnswGetTqQuantileFitOption(index);
 	state.tqRenorm = HnswGetTqRenormOption(index);
+	state.tqExactStorage = HnswGetTqExactStorageOption(index);
 	state.buildExactDistances = hnsw_tq_build_exact_distances;
 	if (state.tqRenorm && state.tqBits >= TQ_DEFAULT_BITS)
 		ereport(NOTICE,
@@ -1668,6 +1681,7 @@ tqgraphbuildempty(Relation index)
 	state.tqWeighted = HnswGetTqWeightedOption(index);
 	state.tqQuantileFit = HnswGetTqQuantileFitOption(index);
 	state.tqRenorm = HnswGetTqRenormOption(index);
+	state.tqExactStorage = HnswGetTqExactStorageOption(index);
 	state.buildExactDistances = hnsw_tq_build_exact_distances;
 	if (state.tqRenorm && state.tqBits >= TQ_DEFAULT_BITS)
 		ereport(NOTICE,
@@ -2757,6 +2771,7 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so)
 	int			payloadSlot = -1;
 	int			candidateOversampling;
 	bool		hasPayloadFilter = false;
+	bool		exactFree;
 
 	INSTR_TIME_SET_CURRENT(totalStart);
 	INSTR_TIME_SET_CURRENT(phaseStart);
@@ -2771,6 +2786,8 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so)
 		return;
 	}
 
+	exactFree = (meta.tqFlags & TQ_GRAPH_EXACT_FREE) != 0 ||
+		!BlockNumberIsValid(meta.tqExactStartBlkno);
 	HnswPrepareTqQuery(scan->indexRelation, &so->support, query, &so->tq);
 	activeTarget = TqGraphGetActiveLimitTupleTarget();
 	estimatedSelectivity = TqGraphGetActiveEstimatedFilterSelectivity();
@@ -2932,6 +2949,15 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so)
 	}
 
 	so->graphCandidateCount = count;
+	if (exactFree)
+	{
+		so->tqGraphResults = results;
+		so->tqGraphResultCount = count;
+		so->tqGraphResultIndex = 0;
+		TqGraphAddElapsedUs(&so->graphTotalUs, totalStart);
+		HnswRecordGraphScanStats(so);
+		return;
+	}
 	rescoreCount = TqGraphFinalRescoreCount(so, results, count, effectiveEf);
 	finalCount = so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_AUTO ?
 		rescoreCount : count;

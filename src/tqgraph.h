@@ -14,6 +14,7 @@
 #define TQ_GRAPH_TQ_PLUS				0x0001	/* metapage: ecShift/ecScale correction tuples present */
 #define TQ_GRAPH_TQ_WEIGHTED			0x0002	/* metapage: code tuples carry per-vector ec_correction */
 #define TQ_GRAPH_TQ_RENORM				0x0004	/* metapage: per-vector scale field stores renormalized l2 / centroid_norm instead of plain l2 */
+#define TQ_GRAPH_EXACT_FREE				0x0008	/* metapage: exact vector slabs are omitted */
 #define TQ_GRAPH_MAX_ENTRY_POINTS		16
 #define TQ_GRAPH_ENTRY_SAMPLE_COUNT		608
 #define TQ_GRAPH_MAX_NEIGHBORS			(HNSW_MAX_M * 2)
@@ -152,6 +153,7 @@ typedef struct TqGraphBuildState
 	bool		tqWeighted;
 	bool		tqQuantileFit;
 	bool		tqRenorm;
+	bool		tqExactStorage;
 	bool		buildExactDistances;	/* short-circuit quantized fast paths during build */
 	int			scoreMode;
 	int			maxLevel;

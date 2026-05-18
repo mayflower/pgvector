@@ -26,7 +26,27 @@ CREATE INDEX tq_policy_default_idx ON tq_policy_data
   WITH (routing = graph);
 SELECT (tq_index_stats('tq_policy_default_idx'::regclass)->>'tq_bits')::int
   AS default_bits;
+SELECT tq_index_stats('tq_policy_default_idx'::regclass)->>'tq_exact_storage'
+  AS default_exact_storage;
 DROP INDEX tq_policy_default_idx;
+
+-- Exact vectors stay on by default, but can be explicitly omitted for
+-- quantized-final graph scans.
+CREATE INDEX tq_policy_exactfree_idx ON tq_policy_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph, tq_exact_storage = off);
+SELECT tq_index_stats('tq_policy_exactfree_idx'::regclass)->>'tq_exact_storage'
+  AS exactfree_exact_storage;
+INSERT INTO tq_policy_data
+SELECT 17, ARRAY(
+    SELECT sin(0.31415 * (k + 17))::real FROM generate_series(0, 1535) k
+)::vector(1536);
+SELECT count(*) FROM (
+    SELECT id FROM tq_policy_data
+    ORDER BY val <-> (SELECT val FROM tq_policy_data WHERE id = 17)
+    LIMIT 5
+) t;
+DROP INDEX tq_policy_exactfree_idx;
 
 -- Explicit 4-bit: same.
 CREATE INDEX tq_policy_4bit_idx ON tq_policy_data

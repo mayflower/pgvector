@@ -488,6 +488,7 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	float	   *ecScale = NULL;
 	bool		insertTqWeighted;
 	bool		insertTqRenorm;
+	bool		insertExactStorage;
 	float		insertXm;
 
 	if (!TqGraphReadMeta(index, &meta))
@@ -520,6 +521,7 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	code = palloc(TqGraphCodeBytesForBits(vector->dim, meta.tqBits));
 	insertTqWeighted = (meta.tqFlags & TQ_GRAPH_TQ_WEIGHTED) != 0;
 	insertTqRenorm = (meta.tqFlags & TQ_GRAPH_TQ_RENORM) != 0;
+	insertExactStorage = (meta.tqFlags & TQ_GRAPH_EXACT_FREE) == 0;
 	insertXm = 0.0f;
 	if (ecShift != NULL && ecScale != NULL)
 	{
@@ -565,7 +567,8 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 		insertSo.support = support;
 		insertSo.efSearch = Max(meta.efConstruction, TqGraphLevelM(meta.m, 0));
 		insertSo.graphOversampling = 1;
-		insertSo.graphRescoreBand = TQ_GRAPH_RESCORE_BAND_EXACT;
+		insertSo.graphRescoreBand = insertExactStorage ?
+			TQ_GRAPH_RESCORE_BAND_EXACT : TQ_GRAPH_RESCORE_BAND_NONE;
 		HnswPrepareTqQuery(index, &support, query, &insertSo.tq);
 
 		TqGraphInitScanStorage(index, &meta, &storage);
@@ -576,8 +579,9 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 		candidateCount = TqGraphTraverse(index, &insertSo, &meta, &storage,
 										  candidates, resultTarget, searchEf,
 										  query, -1, 0);
-		TqGraphExactRescore(index, &insertSo, query, &meta, storage.nodes,
-							candidates, candidateCount);
+		if (insertExactStorage)
+			TqGraphExactRescore(index, &insertSo, query, &meta, storage.nodes,
+								candidates, candidateCount);
 		TqGraphSelectInsertNeighbors(index, &meta, &storage, &support,
 									 candidates, candidateCount, nodeLevel,
 									 selected, selectedCounts);
@@ -590,8 +594,14 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	codeStart = meta.tqCodeStartBlkno;
 	adjStart = meta.tqAdjStartBlkno;
 	exactStart = meta.tqExactStartBlkno;
-	TqGraphAppendInsertedExact(index, &exactStart, newNodeId, vector,
-							   vector->dim, &exactBlkno, &exactOffno);
+	if (insertExactStorage)
+		TqGraphAppendInsertedExact(index, &exactStart, newNodeId, vector,
+								   vector->dim, &exactBlkno, &exactOffno);
+	else
+	{
+		exactBlkno = InvalidBlockNumber;
+		exactOffno = InvalidOffsetNumber;
+	}
 	TqGraphAppendInsertedCode(index, &codeStart, newNodeId, heap_tid, nodeLevel,
 							  vector, code, scale, payloads, payloadMask,
 							  payloadCount, meta.tqBits, exactBlkno, exactOffno,
@@ -613,6 +623,7 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	metaState.tqBits = meta.tqBits;
 	metaState.tqWeighted = (meta.tqFlags & TQ_GRAPH_TQ_WEIGHTED) != 0;
 	metaState.tqRenorm = (meta.tqFlags & TQ_GRAPH_TQ_RENORM) != 0;
+	metaState.tqExactStorage = insertExactStorage;
 	metaState.payloadCount = payloadCount;
 	metaState.payloadBytes = payloadBytes;
 	metaState.ecShift = ecShift;

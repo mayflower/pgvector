@@ -498,6 +498,18 @@ HnswGetTqQuantileFitOption(Relation index)
 	return opts != NULL && opts->tqQuantileFit;
 }
 
+bool
+HnswGetTqExactStorageOption(Relation index)
+{
+	TqOptions  *opts;
+
+	if (!HnswIsTurboquantIndex(index))
+		return true;
+
+	opts = (TqOptions *) index->rd_options;
+	return opts == NULL || opts->tqExactStorage;
+}
+
 static bool
 HnswTqSupportsPackedCodes(Relation index)
 {

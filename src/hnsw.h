@@ -325,6 +325,7 @@ typedef struct TqOptions
 	bool		tqWeighted;		/* tq_weighted: opt into TurboQuant+ per-coord weighted scoring. Distinct from the JSON metadata key "tq_plus" which only indicates that error-correction shift/scale arrays exist on disk. */
 	bool		tqQuantileFit;	/* tq_quantile_fit: replace Welford ecShift/ecScale fit with qdrant-style quantile-anchored fit. */
 	bool		tqRenorm;		/* tq_renorm: opt into TurboQuant+ renormalization residual correction at encode time. Replaces per-vector pre-quant L2 length with l2_length / centroid_norm for Dot/Cosine. */
+	bool		tqExactStorage; /* tq_exact_storage: store full exact vectors for final rescoring. */
 }			TqOptions;
 
 typedef struct HnswGraph
@@ -690,6 +691,7 @@ int			HnswGetTqBits(Relation index);
 bool		HnswGetTqWeightedOption(Relation index);
 bool		HnswGetTqRenormOption(Relation index);
 bool		HnswGetTqQuantileFitOption(Relation index);
+bool		HnswGetTqExactStorageOption(Relation index);
 void		HnswPrepareTqQuery(Relation index, HnswSupport * support, Datum value, HnswTqQuery * tq);
 void		HnswPrepareTqBuildQuery(Relation index, HnswSupport * support, Datum value, HnswTqQuery * tq);
 void		HnswPrepareTqBuildQueryWithCorrection(Relation index, HnswSupport * support, Datum value, HnswTqQuery * tq,

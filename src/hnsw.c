@@ -381,6 +381,9 @@ HnswInit(void)
 	add_bool_reloption(tq_relopt_kind, "tq_renorm",
 					   "Opt into TurboQuant+ renormalization residual correction at encode time.  Replaces the per-vector pre-quantization L2 length with l2_length / centroid_norm so Dot/Cosine scoring corrects for centroid quantization noise.  Default off; only takes effect when ecShift/ecScale corrections are present (cosine/IP builds) and tq_weighted is on.",
 					   false, AccessExclusiveLock);
+	add_bool_reloption(tq_relopt_kind, "tq_exact_storage",
+					   "Store exact vectors in native TurboQuant graph indexes for final exact rescoring.",
+					   true, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -718,6 +721,7 @@ turboquantoptions(Datum reloptions, bool validate)
 		{"tq_weighted", RELOPT_TYPE_BOOL, offsetof(TqOptions, tqWeighted)},
 		{"tq_quantile_fit", RELOPT_TYPE_BOOL, offsetof(TqOptions, tqQuantileFit)},
 		{"tq_renorm", RELOPT_TYPE_BOOL, offsetof(TqOptions, tqRenorm)},
+		{"tq_exact_storage", RELOPT_TYPE_BOOL, offsetof(TqOptions, tqExactStorage)},
 	};
 
 	TqOptions  *opts = (TqOptions *) build_reloptions(reloptions, validate,
@@ -898,6 +902,7 @@ tq_index_stats(PG_FUNCTION_ARGS)
 					 "\"tq_flags\":%u,"
 					 "\"tq_bits\":%u,"
 					 "\"tq_plus\":%s,"
+					 "\"tq_exact_storage\":%s,"
 					 "\"tq_correction_start_block\":%u,"
 					 "\"entry_level\":%d,"
 					 "\"meta_page_kind\":%u,"
@@ -936,6 +941,7 @@ tq_index_stats(PG_FUNCTION_ARGS)
 					 tqFlags,
 					 tqBits,
 					 tqFlags != 0 && tqCorrectionStartBlkno != InvalidBlockNumber ? "true" : "false",
+					 (tqFlags & TQ_GRAPH_EXACT_FREE) != 0 ? "false" : "true",
 					 tqCorrectionStartBlkno,
 					 entryLevel,
 					 metaPageKind,
