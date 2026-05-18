@@ -11,6 +11,10 @@ bool		TqGraphCodeCodeWeightedRawSimdSelf(const uint8 *code,
 											  int dimensions, int bits,
 											  const float *ecScale,
 											  double *raw);
+bool		TqGraphCodeCodeDistance(HnswScanOpaque so, HnswMetaPageData *meta,
+									TqGraphScanNode *aNode,
+									TqGraphScanNode *bNode,
+									double *distance);
 float		TqGraphCodeNorm(const uint8 *code, int dimensions, int bits);
 double		TqGraphCodeCodeWeightedRawScalar(const uint8 *a, const uint8 *b,
 											  int dimensions, int bits,

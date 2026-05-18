@@ -3121,6 +3121,46 @@ TqGraphTryBuildCodeCodeDistance(TqGraphBuildState *state, uint32 a, uint32 b,
 	return false;
 }
 
+bool
+TqGraphCodeCodeDistance(HnswScanOpaque so, HnswMetaPageData *meta,
+						TqGraphScanNode *aNode, TqGraphScanNode *bNode,
+						double *distance)
+{
+	TqGraphBuildState state;
+	TqGraphBuildNode nodes[2];
+
+	if (so == NULL || !so->tq.enabled || meta == NULL ||
+		aNode == NULL || bNode == NULL ||
+		aNode->code == NULL || bNode->code == NULL)
+		return false;
+
+	memset(&state, 0, sizeof(state));
+	memset(nodes, 0, sizeof(nodes));
+	state.nodes = nodes;
+	state.nodeCount = 2;
+	state.dimensions = meta->dimensions;
+	state.tqBits = meta->tqBits;
+	state.tqWeighted = (meta->tqFlags & TQ_GRAPH_TQ_WEIGHTED) != 0;
+	state.scoreMode = so->tq.scoreMode;
+	state.ecShift = so->tq.ecShift;
+	state.ecScale = so->tq.ecScale;
+	if (state.ecShift != NULL)
+		state.mmConst = TqGraphMmConstScalar(state.ecShift, state.dimensions);
+
+	nodes[0].code = aNode->code;
+	nodes[0].scale = aNode->scale;
+	nodes[0].norm = aNode->norm;
+	nodes[0].correction = aNode->codeNorm;
+	nodes[0].ecCorrection = aNode->ecCorrection;
+	nodes[1].code = bNode->code;
+	nodes[1].scale = bNode->scale;
+	nodes[1].norm = bNode->norm;
+	nodes[1].correction = bNode->codeNorm;
+	nodes[1].ecCorrection = bNode->ecCorrection;
+
+	return TqGraphTryBuildCodeCodeDistance(&state, 0, 1, distance);
+}
+
 static double
 TqGraphBuildExactVectorDistance(TqGraphBuildState *state, uint32 a, uint32 b)
 {

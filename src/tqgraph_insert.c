@@ -63,6 +63,55 @@ TqGraphExactDistanceToNode(Relation index, HnswMetaPageData *meta,
 	return distance;
 }
 
+static double
+TqGraphInsertQueryDistanceToNode(Relation index, HnswScanOpaque so,
+								 HnswMetaPageData *meta,
+								 TqGraphScanStorage *storage, uint32 nodeId)
+{
+	if (so == NULL ||
+		nodeId >= meta->tqNodeCount ||
+		!TqGraphLoadCodePage(index, so, meta, storage, nodeId) ||
+		(storage->nodes[nodeId].flags & TQ_GRAPH_NODE_DEAD))
+		return DBL_MAX;
+
+	return TqGraphScoreNode(so, &storage->nodes[nodeId]);
+}
+
+static double
+TqGraphInsertCodeDistanceToNode(Relation index, HnswScanOpaque so,
+								HnswMetaPageData *meta,
+								TqGraphScanStorage *storage,
+								TqGraphScanNode *sourceNode,
+								uint32 sourceNodeId,
+								TqGraphScanNode *newNode, uint32 newNodeId,
+								uint32 nodeId)
+{
+	TqGraphScanNode *targetNode;
+	double		distance;
+
+	if (sourceNode == NULL || (sourceNode->flags & TQ_GRAPH_NODE_DEAD))
+		return DBL_MAX;
+
+	if (nodeId == newNodeId)
+		targetNode = newNode;
+	else
+	{
+		if (nodeId >= meta->tqNodeCount ||
+			!TqGraphLoadCodePage(index, so, meta, storage, nodeId) ||
+			(storage->nodes[nodeId].flags & TQ_GRAPH_NODE_DEAD))
+			return DBL_MAX;
+		targetNode = &storage->nodes[nodeId];
+	}
+
+	if (TqGraphCodeCodeDistance(so, meta, sourceNode, targetNode, &distance))
+		return distance;
+
+	if (nodeId == newNodeId)
+		return TqGraphInsertQueryDistanceToNode(index, so, meta, storage,
+												sourceNodeId);
+	return TqGraphInsertQueryDistanceToNode(index, so, meta, storage, nodeId);
+}
+
 static bool
 TqGraphLoadAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 					int level, uint32 *neighbors, int *count)
@@ -285,7 +334,10 @@ TqGraphSelectInsertNeighbors(Relation index, HnswMetaPageData *meta,
 static void
 TqGraphUpdateReciprocalNeighbor(Relation index, HnswMetaPageData *meta,
 								TqGraphScanStorage *storage,
-								HnswSupport *support, Vector *newVector,
+								HnswScanOpaque so, HnswSupport *support,
+								Vector *newVector, uint8 *newCode,
+								float newScale, float newNorm,
+								float newCodeNorm, float newEcCorrection,
 								uint32 newNodeId, uint32 src, int level)
 {
 	int			maxNeighbors = TqGraphLevelM(meta->m, level);
@@ -329,25 +381,44 @@ TqGraphUpdateReciprocalNeighbor(Relation index, HnswMetaPageData *meta,
 
 		sourceVector = TqGraphReadExactVector(index, &storage->nodes[src],
 											  meta->dimensions);
-		if (sourceVector == NULL)
+		if (sourceVector != NULL)
 		{
-			pfree(ranked);
-			pfree(neighbors);
-			pfree(pruned);
-			return;
+			for (int i = 0; i < count; i++)
+			{
+				ranked[i].nodeId = neighbors[i];
+				if (neighbors[i] == newNodeId)
+					ranked[i].distance = TqGraphExactDistance(support,
+															  PointerGetDatum(sourceVector),
+															  PointerGetDatum(newVector));
+				else
+					ranked[i].distance = TqGraphExactDistanceToNode(index, meta, storage,
+																	support, sourceVector,
+																	neighbors[i]);
+			}
 		}
-
-		for (int i = 0; i < count; i++)
+		else
 		{
-			ranked[i].nodeId = neighbors[i];
-			if (neighbors[i] == newNodeId)
-				ranked[i].distance = TqGraphExactDistance(support,
-														  PointerGetDatum(sourceVector),
-														  PointerGetDatum(newVector));
-			else
-				ranked[i].distance = TqGraphExactDistanceToNode(index, meta, storage,
-																support, sourceVector,
-																neighbors[i]);
+			TqGraphScanNode newNode;
+
+			memset(&newNode, 0, sizeof(newNode));
+			newNode.code = newCode;
+			newNode.level = level;
+			newNode.scale = newScale;
+			newNode.norm = newNorm;
+			newNode.codeNorm = newCodeNorm;
+			newNode.ecCorrection = newEcCorrection;
+			newNode.loaded = true;
+
+			for (int i = 0; i < count; i++)
+			{
+				ranked[i].nodeId = neighbors[i];
+				ranked[i].distance = TqGraphInsertCodeDistanceToNode(index, so,
+																	 meta, storage,
+																	 &storage->nodes[src],
+																	 src, &newNode,
+																	 newNodeId,
+																	 neighbors[i]);
+			}
 		}
 
 		qsort(ranked, count, sizeof(TqGraphFrontierItem), TqGraphInsertFrontierCompare);
@@ -360,7 +431,8 @@ TqGraphUpdateReciprocalNeighbor(Relation index, HnswMetaPageData *meta,
 		memcpy(neighbors, pruned, sizeof(uint32) * prunedCount);
 		count = prunedCount;
 		pfree(ranked);
-		pfree(sourceVector);
+		if (sourceVector != NULL)
+			pfree(sourceVector);
 	}
 
 	TqGraphUpdateAdjTuple(index, meta, src, level, neighbors, count);
@@ -371,15 +443,20 @@ TqGraphUpdateReciprocalNeighbor(Relation index, HnswMetaPageData *meta,
 static void
 TqGraphUpdateReciprocalNeighbors(Relation index, HnswMetaPageData *meta,
 								 TqGraphScanStorage *storage,
-								 HnswSupport *support, Vector *newVector,
+								 HnswScanOpaque so, HnswSupport *support,
+								 Vector *newVector, uint8 *newCode,
+								 float newScale, float newNorm,
+								 float newCodeNorm, float newEcCorrection,
 								 uint32 newNodeId, int nodeLevel,
 								 uint32 **selected, int *selectedCounts)
 {
 	for (int level = 0; level <= nodeLevel; level++)
 	{
 		for (int i = 0; i < selectedCounts[level]; i++)
-			TqGraphUpdateReciprocalNeighbor(index, meta, storage, support,
-											newVector, newNodeId,
+			TqGraphUpdateReciprocalNeighbor(index, meta, storage, so, support,
+											newVector, newCode, newScale,
+											newNorm, newCodeNorm,
+											newEcCorrection, newNodeId,
 											selected[level][i], level);
 	}
 }
@@ -490,6 +567,8 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	bool		insertTqRenorm;
 	bool		insertExactStorage;
 	float		insertXm;
+	float		insertNorm;
+	float		insertCodeNorm;
 
 	if (!TqGraphReadMeta(index, &meta))
 		elog(ERROR, "turboquant native graph metapage is missing or invalid");
@@ -548,6 +627,8 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	}
 	else
 		scale = TqEncodeVectorBits(vector, code, meta.tqBits);
+	insertNorm = TqGraphVectorNorm(vector);
+	insertCodeNorm = TqGraphCodeNorm(code, vector->dim, meta.tqBits);
 	selected = palloc0(sizeof(uint32 *) * levelCapacity);
 	selectedCounts = palloc0(sizeof(int) * levelCapacity);
 	for (int level = 0; level < levelCapacity; level++)
@@ -585,8 +666,10 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 		TqGraphSelectInsertNeighbors(index, &meta, &storage, &support,
 									 candidates, candidateCount, nodeLevel,
 									 selected, selectedCounts);
-		TqGraphUpdateReciprocalNeighbors(index, &meta, &storage, &support,
-										 vector, newNodeId, nodeLevel,
+		TqGraphUpdateReciprocalNeighbors(index, &meta, &storage, &insertSo,
+										 &support, vector, code, scale,
+										 insertNorm, insertCodeNorm, insertXm,
+										 newNodeId, nodeLevel,
 										 selected, selectedCounts);
 		pfree(candidates);
 	}

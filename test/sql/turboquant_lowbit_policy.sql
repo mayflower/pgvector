@@ -34,16 +34,17 @@ DROP INDEX tq_policy_default_idx;
 -- quantized-final graph scans.
 CREATE INDEX tq_policy_exactfree_idx ON tq_policy_data
   USING turboquant (val vector_l2_ops)
-  WITH (routing = graph, tq_exact_storage = off);
+  WITH (routing = graph, tq_exact_storage = off, graph_m = 2, graph_ef_construction = 8);
 SELECT tq_index_stats('tq_policy_exactfree_idx'::regclass)->>'tq_exact_storage'
   AS exactfree_exact_storage;
 INSERT INTO tq_policy_data
-SELECT 17, ARRAY(
-    SELECT sin(0.31415 * (k + 17))::real FROM generate_series(0, 1535) k
-)::vector(1536);
+SELECT id, ARRAY(
+    SELECT sin(0.31415 * (k + id))::real FROM generate_series(0, 1535) k
+)::vector(1536)
+FROM generate_series(17, 48) id;
 SELECT count(*) FROM (
     SELECT id FROM tq_policy_data
-    ORDER BY val <-> (SELECT val FROM tq_policy_data WHERE id = 17)
+    ORDER BY val <-> (SELECT val FROM tq_policy_data WHERE id = 48)
     LIMIT 5
 ) t;
 DROP INDEX tq_policy_exactfree_idx;
