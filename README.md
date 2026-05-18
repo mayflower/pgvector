@@ -663,7 +663,7 @@ SELECT * FROM (
 
 ### RAG Benchmarks
 
-FIQA retrieval benchmark on commit `d200081a458df46ac0cb9964c6a23da194263a30` with 57,638 `text-embedding-3-small` corpus vectors, 648 test queries, cosine distance, `k = 10`, 3 measured passes, 1 warmup pass, and `hnsw.ef_search = 64`.
+FIQA retrieval benchmark with 57,638 `text-embedding-3-small` corpus vectors, 648 test queries, cosine distance, `k = 10`, 3 measured passes, 1 warmup pass, and `hnsw.ef_search = 64`.
 
 | Method | Build ms | Index MB | p50 ms | p95 ms | p99 ms | nDCG@10 | qrels recall@10 | exact recall@10 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

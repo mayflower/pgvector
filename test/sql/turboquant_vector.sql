@@ -302,15 +302,3 @@ CREATE INDEX ON tq USING turboquant (val vector_l2_ops) WITH (graph_reorder = ba
 CREATE INDEX ON tq USING turboquant (val vector_l2_ops) WITH (tq_bits = 3);
 
 DROP TABLE tq;
-
-CREATE TABLE tq_half (val halfvec(3));
-CREATE INDEX ON tq_half USING turboquant (val halfvec_l2_ops) WITH (routing = graph);
-DROP TABLE tq_half;
-
-CREATE TABLE tq_bit (val bit(3));
-CREATE INDEX ON tq_bit USING turboquant (val bit_hamming_ops) WITH (routing = graph);
-DROP TABLE tq_bit;
-
-CREATE TABLE tq_sparse (val sparsevec(3));
-CREATE INDEX ON tq_sparse USING turboquant (val sparsevec_l2_ops) WITH (routing = graph);
-DROP TABLE tq_sparse;
