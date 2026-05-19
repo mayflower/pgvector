@@ -661,6 +661,34 @@ SELECT * FROM (
 
 ## Performance
 
+### RAG Benchmarks
+
+FIQA retrieval benchmark with 57,638 `text-embedding-3-small` corpus vectors, 648 test queries, cosine distance, `k = 10`, 3 measured passes, 1 warmup pass, and `hnsw.ef_search = 64`.
+
+| Method | Build ms | Index MB | p50 ms | p95 ms | p99 ms | nDCG@10 | qrels recall@10 | exact recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TurboQuant graph, 4-bit, exact storage on | 35,762.322 | 393.453 | 0.644 | 0.764 | 0.853 | 0.4410 | 0.5163 | 0.9818 |
+| TurboQuant graph, 4-bit, exact storage off | 35,666.216 | 53.125 | 0.544 | 0.639 | 0.703 | 0.4420 | 0.5132 | 0.9463 |
+| HNSW | 201,022.266 | 450.039 | 1.745 | 2.948 | 3.733 | 0.4438 | 0.5182 | 0.9915 |
+
+With `tq_exact_storage = off`, TurboQuant omits the full-precision vector slab from the index and uses quantized-code ordering only. This makes the FIQA index 88.2% smaller than HNSW in this run, with lower exact recall@10 but similar qrels-based retrieval metrics.
+
+Full details are in [benchmark.md](benchmark.md).
+
+### ANN Benchmarks
+
+GloVe subset benchmark derived from `glove-100-angular` with 100,000 train vectors, 1,000 query vectors, 100 dimensions, cosine distance, exact top-10 ground truth, and `hnsw.ef_search = 64`.
+
+| Method | Recall@10 | Build s | Index MB | p50 ms | p95 ms | p99 ms | QPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TurboQuant graph, 4-bit, exact storage on | 0.8130 | 70.3 | 62.8 | 0.441 | 0.553 | 0.644 | 2238.8 |
+| TurboQuant graph, 4-bit, exact storage off | 0.7304 | 78.8 | 23.7 | 0.379 | 0.642 | 0.815 | 2385.7 |
+| HNSW | 0.8468 | 16.7 | 71.0 | 0.893 | 2.495 | 6.788 | 864.1 |
+
+This ANN run shows the current exact-free tradeoff more harshly than FIQA: exact-free storage is 66.7% smaller than HNSW on this 100-dimensional dataset, but recall@10 drops from 0.8468 for HNSW to 0.7304. Exact-storage TurboQuant is smaller and faster to query than HNSW in this run, but recall@10 is lower at 0.8130 and build time is still about 4.2x slower.
+
+Full details and larger-run boundary checks are in [benchmark2.md](benchmark2.md).
+
 ### Tuning
 
 Use a tool like [PgTune](https://pgtune.leopard.in.ua/) to set initial values for Postgres server parameters. For instance, `shared_buffers` should typically be 25% of the server’s memory. You can find the config file with:

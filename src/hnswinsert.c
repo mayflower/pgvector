@@ -136,6 +136,7 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
 
 	/* Update previous buffer */
 	HnswPageGetOpaque(page)->nextblkno = BufferGetBlockNumber(*nbuf);
+	HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_PAGE_LINK);
 }
 
 /*
@@ -160,11 +161,16 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	OffsetNumber freeOffno = InvalidOffsetNumber;
 	OffsetNumber freeNeighborOffno = InvalidOffsetNumber;
 	BlockNumber newInsertPage = InvalidBlockNumber;
+	BlockNumber appendedLinkBlkno = InvalidBlockNumber;
+	BlockNumber appendedInitBlkno = InvalidBlockNumber;
+	BlockNumber elementBlkno;
+	BlockNumber neighborBlkno;
 	uint8		tupleVersion;
+	bool		appendedPage = false;
 	char	   *base = NULL;
 
 	/* Calculate sizes */
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+	etupSize = HnswElementTupleSize(index, HnswPtrAccess(base, e->value));
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -172,7 +178,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
-	HnswSetElementTuple(base, etup, e);
+	HnswSetElementTuple(index, base, etup, e);
 
 	/* Prepare neighbor tuple */
 	ntup = palloc0(ntupSize);
@@ -232,6 +238,9 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 		if (combinedSize > maxSize && PageGetFreeSpace(page) >= etupSize && !BlockNumberIsValid(HnswPageGetOpaque(page)->nextblkno))
 		{
 			HnswInsertAppendPage(index, &nbuf, &npage, state, page, building);
+			appendedPage = true;
+			appendedLinkBlkno = BufferGetBlockNumber(buf);
+			appendedInitBlkno = BufferGetBlockNumber(nbuf);
 			break;
 		}
 
@@ -258,7 +267,13 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 				GenericXLogFinish(state);
 
 			/* Unlock previous buffer */
+			currentPage = BufferGetBlockNumber(buf);
 			UnlockReleaseBuffer(buf);
+			if (!building)
+			{
+				HnswLogGraphWalRecord(index, MAIN_FORKNUM, currentPage, HNSW_GRAPH_OP_PAGE_LINK);
+				HnswLogGraphWalRecord(index, MAIN_FORKNUM, BufferGetBlockNumber(newbuf), HNSW_GRAPH_OP_PAGE_INIT);
+			}
 
 			/* Prepare new buffer */
 			buf = newbuf;
@@ -275,7 +290,12 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 
 			/* Create new page for neighbors if needed */
 			if (PageGetFreeSpace(page) < combinedSize)
+			{
 				HnswInsertAppendPage(index, &nbuf, &npage, state, page, building);
+				appendedPage = true;
+				appendedLinkBlkno = BufferGetBlockNumber(buf);
+				appendedInitBlkno = BufferGetBlockNumber(nbuf);
+			}
 			else
 			{
 				nbuf = buf;
@@ -328,6 +348,11 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 	}
 
+	HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_ELEMENT_INSERT);
+	HnswMarkPageGraphOp(npage, HNSW_GRAPH_OP_NEIGHBOR_INSERT);
+	elementBlkno = BufferGetBlockNumber(buf);
+	neighborBlkno = BufferGetBlockNumber(nbuf);
+
 	/* Commit */
 	if (building)
 	{
@@ -340,6 +365,16 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	UnlockReleaseBuffer(buf);
 	if (nbuf != buf)
 		UnlockReleaseBuffer(nbuf);
+	if (!building)
+	{
+		if (appendedPage)
+		{
+			HnswLogGraphWalRecord(index, MAIN_FORKNUM, appendedLinkBlkno, HNSW_GRAPH_OP_PAGE_LINK);
+			HnswLogGraphWalRecord(index, MAIN_FORKNUM, appendedInitBlkno, HNSW_GRAPH_OP_PAGE_INIT);
+		}
+		HnswLogGraphWalRecord(index, MAIN_FORKNUM, elementBlkno, HNSW_GRAPH_OP_ELEMENT_INSERT);
+		HnswLogGraphWalRecord(index, MAIN_FORKNUM, neighborBlkno, HNSW_GRAPH_OP_NEIGHBOR_INSERT);
+	}
 
 	/* Update the insert page */
 	if (BlockNumberIsValid(newInsertPage) && newInsertPage != insertPage)
@@ -479,6 +514,8 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 	HnswNeighborTuple ntup;
 	int			startIdx;
 	OffsetNumber offno = element->neighborOffno;
+	BlockNumber updatedBlkno = InvalidBlockNumber;
+	bool		logNeighborUpdate = false;
 
 	/* Register page */
 	buf = ReadBuffer(index, element->neighborPage);
@@ -523,20 +560,27 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 	if (idx >= 0 && idx < ntup->count)
 	{
 		ItemPointer indextid = &ntup->indextids[idx];
+		updatedBlkno = BufferGetBlockNumber(buf);
 
 		/* Update neighbor on the buffer */
 		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
+		HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
 
 		/* Commit */
 		if (building)
 			MarkBufferDirty(buf);
 		else
+		{
 			GenericXLogFinish(state);
+			logNeighborUpdate = true;
+		}
 	}
 	else if (!building)
 		GenericXLogAbort(state);
 
 	UnlockReleaseBuffer(buf);
+	if (logNeighborUpdate)
+		HnswLogGraphWalRecord(index, MAIN_FORKNUM, updatedBlkno, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
 }
 
 /*
@@ -589,6 +633,7 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 	Page		page;
 	GenericXLogState *state;
 	HnswElementTuple etup;
+	BlockNumber blkno;
 	int			i;
 
 	/* Read page */
@@ -624,6 +669,8 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 
 	/* Add heap TID, modifying the tuple on the page directly */
 	etup->heaptids[i] = element->heaptids[0];
+	HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_DUPLICATE_HEAPTID);
+	blkno = BufferGetBlockNumber(buf);
 
 	/* Commit */
 	if (building)
@@ -631,6 +678,8 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 	else
 		GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
+	if (!building)
+		HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno, HNSW_GRAPH_OP_DUPLICATE_HEAPTID);
 
 	return true;
 }
@@ -794,4 +843,48 @@ hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	MemoryContextDelete(insertCtx);
 
 	return false;
+}
+
+bool
+turboquantinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
+				 Relation heap, IndexUniqueCheck checkUnique
+#if PG_VERSION_NUM >= 140000
+				 ,bool indexUnchanged
+#endif
+				 ,IndexInfo *indexInfo
+)
+{
+	bool		result;
+
+	if (HnswUseTqNativeGraph(index))
+		return tqgraphinsert(index, values, isnull, heap_tid, heap, checkUnique
+#if PG_VERSION_NUM >= 140000
+							 ,indexUnchanged
+#endif
+							 ,indexInfo);
+
+	if (!HnswUseTqFlat(index))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("turboquant requires a native graph-compatible opclass"),
+				 errhint("Use the hnsw or ivfflat access method directly for this opclass.")));
+
+	HnswSetForceTurboquantIndex(true);
+	PG_TRY();
+	{
+		result = hnswinsert(index, values, isnull, heap_tid, heap, checkUnique
+#if PG_VERSION_NUM >= 140000
+							,indexUnchanged
+#endif
+							,indexInfo);
+	}
+	PG_CATCH();
+	{
+		HnswSetForceTurboquantIndex(false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	HnswSetForceTurboquantIndex(false);
+
+	return result;
 }

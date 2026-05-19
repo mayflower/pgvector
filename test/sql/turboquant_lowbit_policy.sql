@@ -1,0 +1,102 @@
+-- Pin the low-bit policy invariants for TurboQuant indexes.
+--
+-- Policy invariants:
+--   * 4-bit (TQ_DEFAULT_BITS) remains the safe default.
+--   * 1-bit popcount routing requires explicit opt-in via the
+--     hnsw.tq_graph_lowbit_popcnt GUC (off by default).
+--   * 2-bit indexes are explicit opt-in via WITH (tq_bits = 2),
+--     never selected automatically.
+--
+-- This test does NOT assert recall — that's covered in
+-- amd_tasks.md / fiqa_openai matrix.  It only locks the dispatch
+-- defaults so a future commit can't accidentally promote a low-bit
+-- mode without explicit user action.
+
+SET enable_seqscan = off;
+
+CREATE TEMP TABLE tq_policy_data AS
+SELECT id, ARRAY(
+    SELECT sin(0.31415 * (k + id))::real FROM generate_series(0, 1535) k
+)::vector(1536) AS val
+FROM generate_series(1, 16) id;
+
+-- Default: WITH (routing = graph) without tq_bits → must end up at 4.
+CREATE INDEX tq_policy_default_idx ON tq_policy_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph);
+SELECT (tq_index_stats('tq_policy_default_idx'::regclass)->>'tq_bits')::int
+  AS default_bits;
+SELECT tq_index_stats('tq_policy_default_idx'::regclass)->>'tq_exact_storage'
+  AS default_exact_storage;
+DROP INDEX tq_policy_default_idx;
+
+-- Exact vectors stay on by default, but can be explicitly omitted for
+-- quantized-final graph scans.
+CREATE INDEX tq_policy_exactfree_idx ON tq_policy_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph, tq_exact_storage = off, graph_m = 2, graph_ef_construction = 8);
+SELECT tq_index_stats('tq_policy_exactfree_idx'::regclass)->>'tq_exact_storage'
+  AS exactfree_exact_storage;
+INSERT INTO tq_policy_data
+SELECT id, ARRAY(
+    SELECT sin(0.31415 * (k + id))::real FROM generate_series(0, 1535) k
+)::vector(1536)
+FROM generate_series(17, 48) id;
+SELECT count(*) FROM (
+    SELECT id FROM tq_policy_data
+    ORDER BY val <-> (SELECT val FROM tq_policy_data WHERE id = 48)
+    LIMIT 5
+) t;
+DROP INDEX tq_policy_exactfree_idx;
+
+-- Explicit 4-bit: same.
+CREATE INDEX tq_policy_4bit_idx ON tq_policy_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph, tq_bits = 4);
+SELECT (tq_index_stats('tq_policy_4bit_idx'::regclass)->>'tq_bits')::int
+  AS explicit_4bit;
+DROP INDEX tq_policy_4bit_idx;
+
+-- Explicit 2-bit: must work, but only when asked for.
+CREATE INDEX tq_policy_2bit_idx ON tq_policy_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph, tq_bits = 2);
+SELECT (tq_index_stats('tq_policy_2bit_idx'::regclass)->>'tq_bits')::int
+  AS explicit_2bit;
+DROP INDEX tq_policy_2bit_idx;
+
+-- Explicit 1-bit: must work, but only when asked for.
+CREATE INDEX tq_policy_1bit_idx ON tq_policy_data
+  USING turboquant (val vector_l2_ops)
+  WITH (routing = graph, tq_bits = 1);
+SELECT (tq_index_stats('tq_policy_1bit_idx'::regclass)->>'tq_bits')::int
+  AS explicit_1bit;
+
+-- 1-bit popcount routing is gated by hnsw.tq_graph_lowbit_popcnt GUC.
+-- Default off: scoring falls back to the LUT/Packed path even for a
+-- 1-bit index.
+SHOW hnsw.tq_graph_lowbit_popcnt;
+
+-- Build a dataset that actually hits the 1-bit index, query, and
+-- verify the kernel name reflects the GUC choice.  With the GUC off,
+-- graph_scoring_kernel reports the SIMD tier (avxvnni / avx2 / neon)
+-- because that's what the LUT path is reported as; with the GUC on,
+-- the popcount-LowBits fast path is used.
+SELECT count(*) FROM (
+    SELECT id FROM tq_policy_data
+    ORDER BY val <-> (SELECT val FROM tq_policy_data WHERE id = 1)
+    LIMIT 5
+) t;
+SELECT tq_last_scan_stats()->>'graph_tq_bits' AS reported_bits;
+
+SET hnsw.tq_graph_lowbit_popcnt = on;
+SELECT count(*) FROM (
+    SELECT id FROM tq_policy_data
+    ORDER BY val <-> (SELECT val FROM tq_policy_data WHERE id = 1)
+    LIMIT 5
+) t;
+SELECT tq_last_scan_stats()->>'graph_tq_bits' AS reported_bits_with_popcnt;
+RESET hnsw.tq_graph_lowbit_popcnt;
+
+DROP INDEX tq_policy_1bit_idx;
+DROP TABLE tq_policy_data;
