@@ -64,6 +64,16 @@ typedef struct TqHybridBm25QueryStats
 	uint64		wandThresholdUpdates;
 	uint64		wandActiveSorts;
 	uint64		wandHeapReplacements;
+	int			strategy;
+	uint32		impactTerms;
+	uint64		impactPostingsRead;
+	bool		impactFullPostingsAvoided;
+	int			accumulatorMode;
+	uint64		accumulatorHashLookups;
+	uint64		accumulatorDenseUpdates;
+	uint64		finalHeapReplacements;
+	uint32		finalSortedCount;
+	bool		fullSortAvoided;
 	int			decodeKernel;
 	int			scoreKernel;
 	uint64		simdBlocks;
@@ -91,7 +101,9 @@ typedef struct TqHybridBm25PlanningStats
 #define TQHYBRID_BM25_POSTINGS_TUPLE_TYPE	0x64
 #define TQHYBRID_BM25_BLOCKMAX_TUPLE_TYPE	0x65
 #define TQHYBRID_BM25_DELTA_TUPLE_TYPE		0x66
+#define TQHYBRID_BM25_IMPACT_TUPLE_TYPE		0x67
 #define TQHYBRID_BM25_META_FLAG_TFNORM_Q16 0x0001
+#define TQHYBRID_BM25_META_FLAG_IMPACT_HEAD 0x0002
 #define TQHYBRID_BM25_POSTINGS_ENCODING_MASK 0x00ff
 #define TQHYBRID_BM25_POSTINGS_ENCODING_TFNORM_Q16 0x8000
 #define TQHYBRID_BM25_POSTINGS_ENCODING_DELTA_VARINT 1
@@ -116,6 +128,7 @@ typedef struct TqHybridBm25MetaTupleData
 	BlockNumber lexiconStartBlkno;
 	BlockNumber postingsStartBlkno;
 	BlockNumber blockMaxStartBlkno;
+	BlockNumber impactStartBlkno;
 	BlockNumber deltaStartBlkno;
 	uint64		deltaGeneration;
 	uint32		deltaDocCount;
@@ -123,6 +136,7 @@ typedef struct TqHybridBm25MetaTupleData
 	uint32		deltaTermCount;
 	uint32		postingsPages;
 	uint32		blockMaxPages;
+	uint32		impactPages;
 	uint32		deltaPages;
 	uint64		lastCompactionGeneration;
 	uint32		compactionCount;
@@ -168,7 +182,9 @@ typedef struct TqHybridBm25PostingsTupleData
 	OffsetNumber nextOffno;
 	uint16		maxTf;
 	uint16		encoding;
+	uint16		maxTfNormQ16;
 	uint16		payloadBytes;
+	float4		maxScoreFactor;
 	char		payload[FLEXIBLE_ARRAY_MEMBER];
 } TqHybridBm25PostingsTupleData;
 
@@ -188,6 +204,28 @@ typedef struct TqHybridBm25BlockMaxTupleData
 } TqHybridBm25BlockMaxTupleData;
 
 typedef TqHybridBm25BlockMaxTupleData *TqHybridBm25BlockMaxTuple;
+
+typedef struct TqHybridBm25ImpactTupleEntry
+{
+	uint32		nodeId;
+	uint16		tfNormQ16;
+	uint16		reserved;
+	float4		score;
+} TqHybridBm25ImpactTupleEntry;
+
+typedef struct TqHybridBm25ImpactTupleData
+{
+	uint8		type;
+	uint8		reserved1;
+	uint16		count;
+	uint32		termId;
+	BlockNumber nextBlkno;
+	OffsetNumber nextOffno;
+	uint16		reserved2;
+	TqHybridBm25ImpactTupleEntry entries[FLEXIBLE_ARRAY_MEMBER];
+} TqHybridBm25ImpactTupleData;
+
+typedef TqHybridBm25ImpactTupleData *TqHybridBm25ImpactTuple;
 
 typedef struct TqHybridBm25DeltaTerm
 {
@@ -229,6 +267,9 @@ typedef struct TqHybridBm25LexiconEntryData
 	BlockNumber blockMaxBlkno;
 	OffsetNumber blockMaxOffno;
 	uint16		reserved3;
+	BlockNumber impactBlkno;
+	OffsetNumber impactOffno;
+	uint16		impactCount;
 	char		termBytes[FLEXIBLE_ARRAY_MEMBER];
 } TqHybridBm25LexiconEntryData;
 

@@ -3,6 +3,7 @@
 #include "fmgr.h"
 #include "hnsw.h"
 #include "lib/stringinfo.h"
+#include "tqgraph.h"
 #include "tqhybrid.h"
 #include "tqhybrid_bm25.h"
 #include "utils/fmgrprotos.h"
@@ -25,10 +26,22 @@ static int64 tq_last_graph_adj_pages_read = 0;
 static int64 tq_last_graph_entry_point_count = 0;
 static int64 tq_last_graph_prepare_us = 0;
 static int64 tq_last_graph_traverse_us = 0;
+static int64 tq_last_graph_entry_us = 0;
+static int64 tq_last_graph_base_us = 0;
+static int64 tq_last_graph_batch_us = 0;
+static int64 tq_last_graph_heap_us = 0;
 static int64 tq_last_graph_fill_us = 0;
 static int64 tq_last_graph_rescore_us = 0;
 static int64 tq_last_graph_sort_us = 0;
 static int64 tq_last_graph_total_us = 0;
+static int64 tq_last_graph_dense_requested_k = 0;
+static int64 tq_last_graph_effective_result_target = 0;
+static int64 tq_last_graph_effective_search_ef = 0;
+static int64 tq_last_graph_effective_rescore_band = 0;
+static double tq_last_graph_highdim_widening_multiplier = 1.0;
+static int tq_last_graph_widening_reason = TQ_DENSE_WIDENING_NONE;
+static int tq_last_graph_dense_budget_policy = TQ_DENSE_BUDGET_AUTO;
+static int tq_last_graph_rescore_band_policy = TQ_RESCORE_BAND_POLICY_AUTO;
 static int tq_last_graph_scoring_kernel = TQ_SCORING_SCALAR;
 static int tq_last_exact_vector_kernel = TQ_EXACT_KERNEL_SCALAR;
 static bool tq_last_exact_vector_kernel_recorded = false;
@@ -91,10 +104,22 @@ HnswRecordGraphScanStats(HnswScanOpaque so)
 	tq_last_graph_entry_point_count = so->graphEntryPointCount;
 	tq_last_graph_prepare_us = so->graphPrepareUs;
 	tq_last_graph_traverse_us = so->graphTraverseUs;
+	tq_last_graph_entry_us = so->graphEntryUs;
+	tq_last_graph_base_us = so->graphBaseUs;
+	tq_last_graph_batch_us = so->graphBatchUs;
+	tq_last_graph_heap_us = so->graphHeapUs;
 	tq_last_graph_fill_us = so->graphFillUs;
 	tq_last_graph_rescore_us = so->graphRescoreUs;
 	tq_last_graph_sort_us = so->graphSortUs;
 	tq_last_graph_total_us = so->graphTotalUs;
+	tq_last_graph_dense_requested_k = so->graphDenseRequestedK;
+	tq_last_graph_effective_result_target = so->graphEffectiveResultTarget;
+	tq_last_graph_effective_search_ef = so->graphEffectiveSearchEf;
+	tq_last_graph_effective_rescore_band = so->graphEffectiveRescoreBand;
+	tq_last_graph_highdim_widening_multiplier = so->graphHighdimWideningMultiplier;
+	tq_last_graph_widening_reason = so->graphWideningReason;
+	tq_last_graph_dense_budget_policy = so->graphDenseBudgetPolicy;
+	tq_last_graph_rescore_band_policy = so->graphRescoreBandPolicy;
 	tq_last_graph_scoring_kernel = so->tq.enabled ? so->tq.scoringKernel : TQ_SCORING_SCALAR;
 	if (!tq_last_exact_vector_kernel_recorded && so->graphRescoreCount > 0)
 		tq_last_exact_vector_kernel = TqExpectedExactKernel();
@@ -127,10 +152,22 @@ HnswRecordNonGraphScanStats(void)
 	tq_last_graph_entry_point_count = 0;
 	tq_last_graph_prepare_us = 0;
 	tq_last_graph_traverse_us = 0;
+	tq_last_graph_entry_us = 0;
+	tq_last_graph_base_us = 0;
+	tq_last_graph_batch_us = 0;
+	tq_last_graph_heap_us = 0;
 	tq_last_graph_fill_us = 0;
 	tq_last_graph_rescore_us = 0;
 	tq_last_graph_sort_us = 0;
 	tq_last_graph_total_us = 0;
+	tq_last_graph_dense_requested_k = 0;
+	tq_last_graph_effective_result_target = 0;
+	tq_last_graph_effective_search_ef = 0;
+	tq_last_graph_effective_rescore_band = 0;
+	tq_last_graph_highdim_widening_multiplier = 1.0;
+	tq_last_graph_widening_reason = TQ_DENSE_WIDENING_NONE;
+	tq_last_graph_dense_budget_policy = TQ_DENSE_BUDGET_AUTO;
+	tq_last_graph_rescore_band_policy = TQ_RESCORE_BAND_POLICY_AUTO;
 	tq_last_graph_scoring_kernel = TQ_SCORING_SCALAR;
 	tq_last_exact_vector_kernel = TQ_EXACT_KERNEL_SCALAR;
 	tq_last_exact_vector_kernel_recorded = false;
@@ -221,10 +258,22 @@ tq_last_scan_stats(PG_FUNCTION_ARGS)
 					 "\"graph_entry_point_count\":" INT64_FORMAT ","
 					 "\"graph_prepare_us\":" INT64_FORMAT ","
 					 "\"graph_traverse_us\":" INT64_FORMAT ","
+					 "\"graph_entry_us\":" INT64_FORMAT ","
+					 "\"graph_base_us\":" INT64_FORMAT ","
+					 "\"graph_batch_us\":" INT64_FORMAT ","
+					 "\"graph_heap_us\":" INT64_FORMAT ","
 					 "\"graph_fill_us\":" INT64_FORMAT ","
 					 "\"graph_rescore_us\":" INT64_FORMAT ","
 					 "\"graph_sort_us\":" INT64_FORMAT ","
 					 "\"graph_total_us\":" INT64_FORMAT ","
+					 "\"graph_dense_requested_k\":" INT64_FORMAT ","
+					 "\"graph_effective_result_target\":" INT64_FORMAT ","
+					 "\"graph_effective_search_ef\":" INT64_FORMAT ","
+					 "\"graph_effective_rescore_band\":" INT64_FORMAT ","
+					 "\"graph_highdim_widening_multiplier\":%.3f,"
+					 "\"graph_widening_reason\":\"%s\","
+					 "\"graph_dense_budget_policy\":\"%s\","
+					 "\"graph_rescore_band_policy\":\"%s\","
 					 "\"graph_scoring_kernel\":\"%s\","
 					 "\"dense_simd_kernel\":\"%s\","
 					 "\"dense_simd_force\":\"%s\","
@@ -250,10 +299,22 @@ tq_last_scan_stats(PG_FUNCTION_ARGS)
 					 tq_last_graph_entry_point_count,
 					 tq_last_graph_prepare_us,
 					 tq_last_graph_traverse_us,
+					 tq_last_graph_entry_us,
+					 tq_last_graph_base_us,
+					 tq_last_graph_batch_us,
+					 tq_last_graph_heap_us,
 					 tq_last_graph_fill_us,
 					 tq_last_graph_rescore_us,
 					 tq_last_graph_sort_us,
 					 tq_last_graph_total_us,
+					 tq_last_graph_dense_requested_k,
+					 tq_last_graph_effective_result_target,
+					 tq_last_graph_effective_search_ef,
+					 tq_last_graph_effective_rescore_band,
+					 tq_last_graph_highdim_widening_multiplier,
+					 TqGraphDenseWideningReasonName(tq_last_graph_widening_reason),
+					 TqGraphDenseBudgetPolicyNameExternal(tq_last_graph_dense_budget_policy),
+					 TqGraphRescoreBandPolicyNameExternal(tq_last_graph_rescore_band_policy),
 					 HnswTqScoringKernelName(tq_last_graph_scoring_kernel),
 					 HnswTqScoringKernelName(tq_last_graph_scoring_kernel),
 					 HnswTqSimdForceName(hnsw_tq_simd_force),

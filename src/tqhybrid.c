@@ -62,12 +62,38 @@ int			tqhybrid_debug_postings_chunk_size = 0;
 bool		tqhybrid_enable_exact_rescore_for_bm25_only = false;
 int			tqhybrid_bm25_cache_max_mb = 0;
 int			tqhybrid_bm25_simd_force = TQHYBRID_BM25_SIMD_FORCE_AUTO;
+bool		tqhybrid_bm25_force_full_sort = false;
+int			tqhybrid_bm25_accumulator_mode = TQHYBRID_BM25_ACCUMULATOR_AUTO;
+int			tqhybrid_bm25_dense_accumulator_threshold = 4096;
+double		tqhybrid_bm25_dense_accumulator_df_ratio = 0.05;
+int			tqhybrid_bm25_strategy = TQHYBRID_BM25_STRATEGY_AUTO;
+bool		tqhybrid_auto_budget = true;
+int			tqhybrid_auto_budget_min_dense_k = 32;
+int			tqhybrid_auto_budget_min_bm25_k = 32;
+int			tqhybrid_auto_budget_limit_multiplier = 8;
+int			tqhybrid_auto_budget_quality_cap = 400;
 
 static const struct config_enum_entry tqhybrid_bm25_simd_force_options[] = {
 	{"auto", TQHYBRID_BM25_SIMD_FORCE_AUTO, false},
 	{"scalar", TQHYBRID_BM25_SIMD_FORCE_SCALAR, false},
 	{"avx2", TQHYBRID_BM25_SIMD_FORCE_AVX2, false},
 	{"neon", TQHYBRID_BM25_SIMD_FORCE_NEON, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry tqhybrid_bm25_accumulator_mode_options[] = {
+	{"hash", TQHYBRID_BM25_ACCUMULATOR_HASH, false},
+	{"node_generation_arrays", TQHYBRID_BM25_ACCUMULATOR_DENSE, false},
+	{"auto", TQHYBRID_BM25_ACCUMULATOR_AUTO, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry tqhybrid_bm25_strategy_options[] = {
+	{"auto", TQHYBRID_BM25_STRATEGY_AUTO, false},
+	{"impact", TQHYBRID_BM25_STRATEGY_IMPACT, false},
+	{"wand", TQHYBRID_BM25_STRATEGY_WAND, false},
+	{"daat_simd", TQHYBRID_BM25_STRATEGY_DAAT_SIMD, false},
+	{"daat_hash", TQHYBRID_BM25_STRATEGY_DAAT_HASH, false},
 	{NULL, 0, false}
 };
 
@@ -93,6 +119,63 @@ TqHybridBm25SimdForceName(int force)
 			return "neon";
 		default:
 			return "unknown";
+	}
+}
+
+const char *
+TqHybridBm25AccumulatorModeName(int mode)
+{
+	switch ((TqHybridBm25AccumulatorMode) mode)
+	{
+		case TQHYBRID_BM25_ACCUMULATOR_HASH:
+			return "hash";
+		case TQHYBRID_BM25_ACCUMULATOR_DENSE:
+			return "node_generation_arrays";
+		case TQHYBRID_BM25_ACCUMULATOR_AUTO:
+			return "auto";
+		default:
+			return "unknown";
+	}
+}
+
+const char *
+TqHybridBm25StrategyName(int strategy)
+{
+	switch ((TqHybridBm25Strategy) strategy)
+	{
+		case TQHYBRID_BM25_STRATEGY_AUTO:
+			return "auto";
+		case TQHYBRID_BM25_STRATEGY_IMPACT:
+			return "impact";
+		case TQHYBRID_BM25_STRATEGY_WAND:
+			return "wand";
+		case TQHYBRID_BM25_STRATEGY_DAAT_SIMD:
+			return "daat_simd";
+		case TQHYBRID_BM25_STRATEGY_DAAT_HASH:
+			return "daat_hash";
+		default:
+			return "unknown";
+	}
+}
+
+const char *
+TqHybridBm25RuntimeStrategyName(int strategy)
+{
+	switch ((TqHybridBm25RuntimeStrategy) strategy)
+	{
+		case TQHYBRID_BM25_RUNTIME_IMPACT_SINGLE:
+			return "impact_single";
+		case TQHYBRID_BM25_RUNTIME_IMPACT_SEEDED_WAND:
+			return "impact_seeded_wand";
+		case TQHYBRID_BM25_RUNTIME_WAND:
+			return "wand";
+		case TQHYBRID_BM25_RUNTIME_DAAT_SIMD:
+			return "daat_simd";
+		case TQHYBRID_BM25_RUNTIME_DAAT_HASH:
+			return "daat_hash";
+		case TQHYBRID_BM25_RUNTIME_NONE:
+		default:
+			return "none";
 	}
 }
 
@@ -160,6 +243,7 @@ static bool TqHybridPathHasFilter(IndexPath *path);
 static bool TqHybridFindConstQueryWalker(Node *node, void *context);
 static HybridQueryHeader *TqHybridFindConstQuery(List *indexorderbys);
 static int TqHybridEstimateTsQueryTerms(TSQuery query);
+static int	TqHybridCurrentLimit(void);
 
 typedef struct TqHybridResult
 {
@@ -196,9 +280,24 @@ typedef struct TqHybridLastScanStats
 {
 	char		fusion[16];
 	uint32		denseCandidatesRequested;
+	uint32		denseCandidatesEffective;
+	bool		denseKDefaulted;
 	uint32		denseCandidates;
+	uint32		denseEffectiveResultTarget;
+	uint32		denseEffectiveSearchEf;
+	uint32		denseEffectiveRescoreBand;
+	double		denseHighdimWideningMultiplier;
+	int			denseWideningReason;
+	int			denseBudgetPolicy;
+	int			denseRescoreBandPolicy;
 	uint32		bm25CandidatesRequested;
+	uint32		bm25CandidatesEffective;
+	bool		bm25KDefaulted;
 	uint32		bm25Candidates;
+	uint32		rrfKRequested;
+	uint32		rrfKEffective;
+	bool		rrfKDefaulted;
+	uint32		autoBudgetLimit;
 	uint32		unionCandidates;
 	uint32		finalResults;
 	char		fusionStrategy[16];
@@ -210,6 +309,15 @@ typedef struct TqHybridLastScanStats
 	uint64		graphVisitedNodes;
 	uint64		graphScoredCodes;
 	uint64		graphExactRescoreCount;
+	uint64		graphPrepareUs;
+	uint64		graphTraverseUs;
+	uint64		graphEntryUs;
+	uint64		graphBaseUs;
+	uint64		graphBatchUs;
+	uint64		graphHeapUs;
+	uint64		graphFillUs;
+	uint64		graphRescoreUs;
+	uint64		graphSortUs;
 	uint32		bm25Terms;
 	uint64		bm25PostingsDecoded;
 	uint64		bm25BlocksVisited;
@@ -227,9 +335,19 @@ typedef struct TqHybridLastScanStats
 	uint32		bm25DeltaCacheTerms;
 	bool		bm25DeltaCacheHit;
 	uint64		bm25WandIterations;
-	uint64		bm25WandThresholdUpdates;
-	uint64		bm25WandActiveSorts;
-	uint64		bm25WandHeapReplacements;
+		uint64		bm25WandThresholdUpdates;
+		uint64		bm25WandActiveSorts;
+		uint64		bm25WandHeapReplacements;
+		int			bm25Strategy;
+		uint32		bm25ImpactTerms;
+		uint64		bm25ImpactPostingsRead;
+		bool		bm25ImpactFullPostingsAvoided;
+		int			bm25AccumulatorMode;
+	uint64		bm25AccumulatorHashLookups;
+	uint64		bm25AccumulatorDenseUpdates;
+	uint64		bm25FinalHeapReplacements;
+	uint32		bm25FinalSortedCount;
+	bool		bm25FullSortAvoided;
 	int			bm25DecodeKernel;
 	int			bm25ScoreKernel;
 	uint64		bm25SimdBlocks;
@@ -515,6 +633,122 @@ TqHybridFinalTarget(HybridQueryHeader *query, int mergedCount)
 	return finalCount;
 }
 
+static int
+TqHybridConstLimitValue(Node *limitCount)
+{
+	Const	   *constant;
+	int64		value;
+
+	if (limitCount == NULL || !IsA(limitCount, Const))
+		return 0;
+
+	constant = castNode(Const, limitCount);
+	if (constant->constisnull)
+		return 0;
+
+	switch (constant->consttype)
+	{
+		case INT2OID:
+			value = DatumGetInt16(constant->constvalue);
+			break;
+		case INT4OID:
+			value = DatumGetInt32(constant->constvalue);
+			break;
+		case INT8OID:
+			value = DatumGetInt64(constant->constvalue);
+			break;
+		default:
+			return 0;
+	}
+
+	if (value <= 0)
+		return 0;
+	return value > INT_MAX ? INT_MAX : (int) value;
+}
+
+static int
+TqHybridFindLimitInPlan(Plan *plan)
+{
+	int			limit;
+
+	if (plan == NULL)
+		return 0;
+
+	if (IsA(plan, Limit))
+	{
+		Limit	   *limitPlan = castNode(Limit, plan);
+
+		limit = TqHybridConstLimitValue(limitPlan->limitCount);
+		if (limit > 0)
+			return limit;
+	}
+
+	limit = TqHybridFindLimitInPlan(plan->lefttree);
+	if (limit > 0)
+		return limit;
+
+	return TqHybridFindLimitInPlan(plan->righttree);
+}
+
+static int
+TqHybridCurrentLimit(void)
+{
+	PlannedStmt *plannedstmt = TqHybridCurrentPlannedStmt();
+
+	if (plannedstmt == NULL || plannedstmt->planTree == NULL)
+		return 0;
+
+	return TqHybridFindLimitInPlan(plannedstmt->planTree);
+}
+
+static int
+TqHybridApplyAutoBudget(int requested, int limit, int minBudget,
+						bool defaulted, bool branchPresent)
+{
+	int			target;
+
+	if (!tqhybrid_auto_budget || !defaulted || !branchPresent ||
+		requested <= 0 || limit <= 0)
+		return requested;
+
+	if (limit > INT_MAX / tqhybrid_auto_budget_limit_multiplier)
+		target = INT_MAX;
+	else
+		target = limit * tqhybrid_auto_budget_limit_multiplier;
+
+	target = Max(target, minBudget);
+	if (tqhybrid_auto_budget_quality_cap > 0)
+		target = Min(target, tqhybrid_auto_budget_quality_cap);
+
+	return Min(requested, target);
+}
+
+static HybridQueryHeader *
+TqHybridEffectiveQuery(HybridQueryHeader *query, int limit,
+					   MemoryContext memoryContext)
+{
+	HybridQueryHeader *effective;
+	Size		querySize = VARSIZE_ANY(query);
+	bool		hasVector =
+		(query->flags & HYBRID_QUERY_FLAG_HAS_VECTOR) != 0;
+	bool		hasTsQuery =
+		(query->flags & HYBRID_QUERY_FLAG_HAS_TSQUERY) != 0;
+
+	effective = MemoryContextAlloc(memoryContext, querySize);
+	memcpy(effective, query, querySize);
+
+	effective->denseK = TqHybridApplyAutoBudget(query->denseK, limit,
+												tqhybrid_auto_budget_min_dense_k,
+												(query->flags & HYBRID_QUERY_FLAG_DENSE_K_DEFAULTED) != 0,
+												hasVector);
+	effective->bm25K = TqHybridApplyAutoBudget(query->bm25K, limit,
+											   tqhybrid_auto_budget_min_bm25_k,
+											   (query->flags & HYBRID_QUERY_FLAG_BM25_K_DEFAULTED) != 0,
+											   hasTsQuery);
+
+	return effective;
+}
+
 static void
 TqHybridTopNHeapSiftUp(TqHybridResult *heap, int index)
 {
@@ -715,6 +949,9 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 	TqHybridLastScanStats lastStats;
 	instr_time	totalStart;
 	instr_time	phaseStart;
+	HybridQueryHeader *originalQuery = state->query;
+	HybridQueryHeader *scanQuery;
+	int			autoBudgetLimit;
 
 	if (state->collectDone)
 		return;
@@ -724,18 +961,21 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 	memset(&bm25Stats, 0, sizeof(bm25Stats));
 	memset(&lastStats, 0, sizeof(lastStats));
 	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
-	if ((state->query->flags & HYBRID_QUERY_FLAG_HAS_VECTOR) != 0 &&
-		state->query->denseK > 0)
+	autoBudgetLimit = TqHybridCurrentLimit();
+	scanQuery = TqHybridEffectiveQuery(originalQuery, autoBudgetLimit, so->tmpCtx);
+	state->query = scanQuery;
+	if ((scanQuery->flags & HYBRID_QUERY_FLAG_HAS_VECTOR) != 0 &&
+		scanQuery->denseK > 0)
 	{
 		INSTR_TIME_SET_CURRENT(phaseStart);
-		denseCount = TqGraphCollectDenseCandidates(scan, state->query->denseK,
+		denseCount = TqGraphCollectDenseCandidates(scan, scanQuery->denseK,
 												   &dense, so->tmpCtx,
 												   &denseStats);
 		lastStats.denseElapsedUs = TqHybridElapsedUs(phaseStart);
 	}
 
-	if ((state->query->flags & HYBRID_QUERY_FLAG_HAS_TSQUERY) != 0 &&
-		state->query->bm25K > 0)
+	if ((scanQuery->flags & HYBRID_QUERY_FLAG_HAS_TSQUERY) != 0 &&
+		scanQuery->bm25K > 0)
 	{
 		TqHybridOptions *opts = (TqHybridOptions *) scan->indexRelation->rd_options;
 		bool		useWand = tqhybrid_enable_wand &&
@@ -743,8 +983,8 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 
 		INSTR_TIME_SET_CURRENT(phaseStart);
 		bm25Count = TqHybridBm25TopK(scan->indexRelation,
-									 HybridQueryGetTsQuery(state->query),
-									 state->query->bm25K, useWand, so->tmpCtx,
+									 HybridQueryGetTsQuery(scanQuery),
+									 scanQuery->bm25K, useWand, so->tmpCtx,
 									 &bm25, &bm25Stats);
 		lastStats.bm25ElapsedUs = TqHybridElapsedUs(phaseStart);
 	}
@@ -787,12 +1027,12 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 		{
 			TqHybridResult item;
 
-			if (!slots[i].used)
-				continue;
-			item = slots[i].result;
-			if ((state->query->flags & HYBRID_QUERY_FLAG_REQUIRE_BM25_MATCH) != 0 &&
-				!item.hasBm25)
-				continue;
+				if (!slots[i].used)
+					continue;
+				item = slots[i].result;
+				if ((scanQuery->flags & HYBRID_QUERY_FLAG_REQUIRE_BM25_MATCH) != 0 &&
+					!item.hasBm25)
+					continue;
 			if (item.hasDense && item.hasBm25)
 				lastStats.bothMatch++;
 			else if (item.hasDense)
@@ -805,7 +1045,7 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 		TqHybridCheckBm25OnlyExactRescore(state, merged, mergedCount);
 		TqHybridScoreResults(state, merged, mergedCount);
 
-		finalCount = TqHybridFinalTarget(state->query, mergedCount);
+		finalCount = TqHybridFinalTarget(scanQuery, mergedCount);
 		if (finalCount < mergedCount)
 			finalCount = TqHybridSelectTopN(merged, mergedCount, finalCount,
 											&merged, so->tmpCtx);
@@ -855,7 +1095,7 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 				i++;
 			}
 
-			if ((state->query->flags & HYBRID_QUERY_FLAG_REQUIRE_BM25_MATCH) != 0 &&
+			if ((scanQuery->flags & HYBRID_QUERY_FLAG_REQUIRE_BM25_MATCH) != 0 &&
 				!item.hasBm25)
 				continue;
 			if (item.hasDense && item.hasBm25)
@@ -873,7 +1113,7 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 			qsort(merged, mergedCount, sizeof(TqHybridResult),
 				  TqHybridScoreCompare);
 
-		finalCount = TqHybridFinalTarget(state->query, mergedCount);
+		finalCount = TqHybridFinalTarget(scanQuery, mergedCount);
 		strlcpy(lastStats.fusionStrategy, "sort",
 				sizeof(lastStats.fusionStrategy));
 		lastStats.fusionHeapSize = finalCount;
@@ -887,18 +1127,46 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 
 	strlcpy(lastStats.fusion,
 			HybridQueryFusionName(tqhybrid_force_fusion != 0 ?
-								  tqhybrid_force_fusion : state->query->fusion),
+								  tqhybrid_force_fusion : scanQuery->fusion),
 			sizeof(lastStats.fusion));
-	lastStats.denseCandidatesRequested = state->query->denseK;
+	lastStats.denseCandidatesRequested = originalQuery->denseK;
+	lastStats.denseCandidatesEffective = scanQuery->denseK;
+	lastStats.denseKDefaulted =
+		(originalQuery->flags & HYBRID_QUERY_FLAG_DENSE_K_DEFAULTED) != 0;
 	lastStats.denseCandidates = denseCount;
-	lastStats.bm25CandidatesRequested = state->query->bm25K;
+	lastStats.denseEffectiveResultTarget = denseStats.effectiveResultTarget;
+	lastStats.denseEffectiveSearchEf = denseStats.effectiveSearchEf;
+	lastStats.denseEffectiveRescoreBand = denseStats.effectiveRescoreBand;
+	lastStats.denseHighdimWideningMultiplier =
+		denseStats.highdimWideningMultiplier;
+	lastStats.denseWideningReason = denseStats.wideningReason;
+	lastStats.denseBudgetPolicy = denseStats.denseBudgetPolicy;
+	lastStats.denseRescoreBandPolicy = denseStats.rescoreBandPolicy;
+	lastStats.bm25CandidatesRequested = originalQuery->bm25K;
+	lastStats.bm25CandidatesEffective = scanQuery->bm25K;
+	lastStats.bm25KDefaulted =
+		(originalQuery->flags & HYBRID_QUERY_FLAG_BM25_K_DEFAULTED) != 0;
 	lastStats.bm25Candidates = bm25Count;
+	lastStats.rrfKRequested = originalQuery->rrfK;
+	lastStats.rrfKEffective = scanQuery->rrfK;
+	lastStats.rrfKDefaulted =
+		(originalQuery->flags & HYBRID_QUERY_FLAG_RRF_K_DEFAULTED) != 0;
+	lastStats.autoBudgetLimit = autoBudgetLimit;
 	lastStats.unionCandidates = mergedCount;
 	lastStats.finalResults = finalCount;
 	lastStats.fusionCandidatesSeen = fusionCandidatesSeen;
 	lastStats.graphVisitedNodes = denseStats.visitedGraphNodes;
 	lastStats.graphScoredCodes = denseStats.scoredCodes;
 	lastStats.graphExactRescoreCount = denseStats.exactRescoreCount;
+	lastStats.graphPrepareUs = denseStats.prepareUs;
+	lastStats.graphTraverseUs = denseStats.traverseUs;
+	lastStats.graphEntryUs = denseStats.entryUs;
+	lastStats.graphBaseUs = denseStats.baseUs;
+	lastStats.graphBatchUs = denseStats.batchUs;
+	lastStats.graphHeapUs = denseStats.heapUs;
+	lastStats.graphFillUs = denseStats.fillUs;
+	lastStats.graphRescoreUs = denseStats.rescoreUs;
+	lastStats.graphSortUs = denseStats.sortUs;
 	lastStats.bm25Terms = bm25Stats.queryTerms;
 	lastStats.bm25PostingsDecoded = bm25Stats.postingsDecoded;
 	lastStats.bm25BlocksVisited = bm25Stats.blocksVisited;
@@ -919,14 +1187,26 @@ TqHybridCollectScanResults(IndexScanDesc scan, TqHybridScanState *state)
 	lastStats.bm25WandThresholdUpdates = bm25Stats.wandThresholdUpdates;
 	lastStats.bm25WandActiveSorts = bm25Stats.wandActiveSorts;
 	lastStats.bm25WandHeapReplacements = bm25Stats.wandHeapReplacements;
+	lastStats.bm25Strategy = bm25Stats.strategy;
+	lastStats.bm25ImpactTerms = bm25Stats.impactTerms;
+	lastStats.bm25ImpactPostingsRead = bm25Stats.impactPostingsRead;
+	lastStats.bm25ImpactFullPostingsAvoided =
+		bm25Stats.impactFullPostingsAvoided;
+	lastStats.bm25AccumulatorMode = bm25Stats.accumulatorMode;
+	lastStats.bm25AccumulatorHashLookups = bm25Stats.accumulatorHashLookups;
+	lastStats.bm25AccumulatorDenseUpdates = bm25Stats.accumulatorDenseUpdates;
+	lastStats.bm25FinalHeapReplacements = bm25Stats.finalHeapReplacements;
+	lastStats.bm25FinalSortedCount = bm25Stats.finalSortedCount;
+	lastStats.bm25FullSortAvoided = bm25Stats.fullSortAvoided;
 	lastStats.bm25DecodeKernel = bm25Stats.decodeKernel;
 	lastStats.bm25ScoreKernel = bm25Stats.scoreKernel;
 	lastStats.bm25SimdBlocks = bm25Stats.simdBlocks;
 	lastStats.bm25ScalarTailPostings = bm25Stats.scalarTailPostings;
-	lastStats.elapsedUs = TqHybridElapsedUs(totalStart);
-	tqhybrid_last_scan_stats = lastStats;
-	MemoryContextSwitchTo(oldCtx);
-}
+		lastStats.elapsedUs = TqHybridElapsedUs(totalStart);
+		tqhybrid_last_scan_stats = lastStats;
+		state->query = originalQuery;
+		MemoryContextSwitchTo(oldCtx);
+	}
 
 static IndexBuildResult *
 tqhybridbuild(Relation heap, Relation index, IndexInfo *indexInfo)
@@ -1262,6 +1542,8 @@ tqhybridcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
+	MemSet(&bm25Stats, 0, sizeof(bm25Stats));
+	query = TqHybridFindConstQuery(path->indexorderbys);
 
 	index = index_open(path->indexinfo->indexoid, NoLock);
 	opts = (TqHybridOptions *) index->rd_options;
@@ -1274,9 +1556,7 @@ tqhybridcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		graphMeta.graphOversampling = opts != NULL ?
 			opts->graphOversampling : TQ_DEFAULT_GRAPH_OVERSAMPLING;
 	}
-	(void) TqHybridBm25GetPlanningStats(index, &bm25Stats);
 
-	query = TqHybridFindConstQuery(path->indexorderbys);
 	if (query != NULL)
 	{
 		denseK = HybridQueryGetVector(query) != NULL ? query->denseK : 0;
@@ -1292,6 +1572,8 @@ tqhybridcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		finalK = Max(denseK + bm25K, 1);
 		termCount = 2;
 	}
+	if (bm25K > 0)
+		(void) TqHybridBm25GetPlanningStats(index, &bm25Stats);
 
 	tuples = Max(path->indexinfo->tuples, 1.0);
 	m = graphMeta.m > 0 ? graphMeta.m :
@@ -1375,6 +1657,9 @@ tqhybridoptions(Datum reloptions, bool validate)
 			{"bm25_b", RELOPT_TYPE_REAL, offsetof(TqHybridOptions, bm25B)},
 			{"bm25_block_max", RELOPT_TYPE_BOOL, offsetof(TqHybridOptions, bm25BlockMax)},
 			{"bm25_precompute_tf_norm", RELOPT_TYPE_BOOL, offsetof(TqHybridOptions, bm25PrecomputeTfNorm)},
+			{"bm25_impact_head", RELOPT_TYPE_BOOL, offsetof(TqHybridOptions, bm25ImpactHead)},
+			{"bm25_impact_min_df", RELOPT_TYPE_INT, offsetof(TqHybridOptions, bm25ImpactMinDf)},
+			{"bm25_impact_head_k", RELOPT_TYPE_INT, offsetof(TqHybridOptions, bm25ImpactHeadK)},
 			{"bm25_delta_compaction_threshold", RELOPT_TYPE_INT, offsetof(TqHybridOptions, bm25DeltaCompactionThreshold)},
 			{"hybrid_default_fusion", RELOPT_TYPE_ENUM, offsetof(TqHybridOptions, hybridDefaultFusion)},
 			{"hybrid_default_dense_k", RELOPT_TYPE_INT, offsetof(TqHybridOptions, hybridDefaultDenseK)},
@@ -1462,6 +1747,15 @@ TqHybridInit(void)
 	add_bool_reloption(tqhybrid_relopt_kind, "bm25_precompute_tf_norm",
 					   "Store compact precomputed BM25 term-frequency normalization per base posting.",
 					   true, AccessExclusiveLock);
+	add_bool_reloption(tqhybrid_relopt_kind, "bm25_impact_head",
+					   "Enable cached impact-head fast path for high-df single-term BM25 scans.",
+					   true, AccessExclusiveLock);
+	add_int_reloption(tqhybrid_relopt_kind, "bm25_impact_min_df",
+					  "Minimum base document frequency for BM25 impact-head caching.",
+					  1024, 1, INT_MAX, AccessExclusiveLock);
+	add_int_reloption(tqhybrid_relopt_kind, "bm25_impact_head_k",
+					  "Per-term cached BM25 impact-head size.",
+					  2048, 1, INT_MAX, AccessExclusiveLock);
 	add_int_reloption(tqhybrid_relopt_kind, "bm25_delta_compaction_threshold",
 					  "Delta document percentage of the base BM25 segment that triggers vacuum compaction.",
 					  25, 1, 1000, AccessExclusiveLock);
@@ -1492,12 +1786,29 @@ TqHybridInit(void)
 	DefineCustomIntVariable("hybrid.default_bm25_k", "Default BM25 candidate budget for hybrid_query callers",
 							NULL, &tqhybrid_default_bm25_k,
 							TQHYBRID_DEFAULT_BM25_K, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomIntVariable("hybrid.default_rrf_k", "Default RRF constant for hybrid_query callers",
-							NULL, &tqhybrid_default_rrf_k,
-							TQHYBRID_DEFAULT_RRF_K, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomEnumVariable("hybrid.force_fusion", "Force a turbohybrid fusion mode for debugging",
-							 "off honors each hybrid_query value.",
-							 &tqhybrid_force_fusion, 0,
+		DefineCustomIntVariable("hybrid.default_rrf_k", "Default RRF constant for hybrid_query callers",
+								NULL, &tqhybrid_default_rrf_k,
+								TQHYBRID_DEFAULT_RRF_K, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+		DefineCustomBoolVariable("hybrid.auto_budget", "Enable LIMIT-aware auto budgets for omitted hybrid_query candidate budgets",
+								 "Explicit dense_k and bm25_k values are preserved.",
+								 &tqhybrid_auto_budget,
+								 true, PGC_USERSET, 0, NULL, NULL, NULL);
+		DefineCustomIntVariable("hybrid.auto_budget_min_dense_k", "Minimum dense candidate budget chosen by LIMIT-aware auto budgeting",
+								NULL, &tqhybrid_auto_budget_min_dense_k,
+								32, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+		DefineCustomIntVariable("hybrid.auto_budget_min_bm25_k", "Minimum BM25 candidate budget chosen by LIMIT-aware auto budgeting",
+								NULL, &tqhybrid_auto_budget_min_bm25_k,
+								32, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+		DefineCustomIntVariable("hybrid.auto_budget_limit_multiplier", "Multiplier applied to SQL LIMIT for omitted hybrid_query candidate budgets",
+								NULL, &tqhybrid_auto_budget_limit_multiplier,
+								8, 1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+		DefineCustomIntVariable("hybrid.auto_budget_quality_cap", "Maximum candidate budget chosen by LIMIT-aware auto budgeting",
+								"Set to 0 to disable the cap.",
+								&tqhybrid_auto_budget_quality_cap,
+								400, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+		DefineCustomEnumVariable("hybrid.force_fusion", "Force a turbohybrid fusion mode for debugging",
+								 "off honors each hybrid_query value.",
+								 &tqhybrid_force_fusion, 0,
 							 tqhybrid_force_fusion_options, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("hybrid.fusion_hash_threshold", "Candidate count threshold for turbohybrid hash/top-N fusion",
 							"Use -1 to force sort fusion, 0 to force hash/top-N fusion.",
@@ -1520,6 +1831,28 @@ TqHybridInit(void)
 							 TQHYBRID_BM25_SIMD_FORCE_AUTO,
 							 tqhybrid_bm25_simd_force_options,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("hybrid.bm25_force_full_sort", "Force full touched-candidate sort for turbohybrid BM25 scans",
+							 "Default off uses bounded final top-k extraction after tsquery Boolean filtering.",
+							 &tqhybrid_bm25_force_full_sort,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomEnumVariable("hybrid.bm25_accumulator_mode", "Select turbohybrid BM25 accumulator storage",
+							 "auto uses backend-local node-generation arrays for high-df queries and hash storage otherwise.",
+							 &tqhybrid_bm25_accumulator_mode,
+							 TQHYBRID_BM25_ACCUMULATOR_AUTO,
+							 tqhybrid_bm25_accumulator_mode_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("hybrid.bm25_dense_accumulator_threshold", "BM25 summed-df threshold for dense accumulator auto mode",
+							NULL, &tqhybrid_bm25_dense_accumulator_threshold,
+							4096, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("hybrid.bm25_dense_accumulator_df_ratio", "BM25 max df/doc_count ratio for dense accumulator auto mode",
+							 NULL, &tqhybrid_bm25_dense_accumulator_df_ratio,
+							 0.05, 0.0, 1.0, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomEnumVariable("hybrid.bm25_strategy", "Select turbohybrid BM25 scoring strategy",
+							 "auto chooses impact-head, WAND, or DAAT by query shape; explicit values force the requested path when applicable.",
+							 &tqhybrid_bm25_strategy,
+							 TQHYBRID_BM25_STRATEGY_AUTO,
+							 tqhybrid_bm25_strategy_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("hybrid");
 }
 
@@ -1531,12 +1864,27 @@ hybrid_last_scan_stats(PG_FUNCTION_ARGS)
 
 	initStringInfo(&json);
 	appendStringInfo(&json,
-					 "{\"fusion\":\"%s\","
-					 "\"dense_candidates_requested\":%u,"
-					 "\"dense_candidates\":%u,"
-					 "\"bm25_candidates_requested\":%u,"
-					 "\"bm25_candidates\":%u,"
-					 "\"union_candidates\":%u,"
+						 "{\"fusion\":\"%s\","
+						 "\"dense_candidates_requested\":%u,"
+						 "\"dense_candidates_effective\":%u,"
+						 "\"dense_k_defaulted\":%s,"
+						 "\"dense_candidates\":%u,"
+					 "\"dense_effective_result_target\":%u,"
+					 "\"dense_effective_search_ef\":%u,"
+					 "\"dense_effective_rescore_band\":%u,"
+					 "\"dense_highdim_widening_multiplier\":%.3f,"
+					 "\"dense_widening_reason\":\"%s\","
+						 "\"dense_budget_policy\":\"%s\","
+						 "\"dense_rescore_band_policy\":\"%s\","
+						 "\"bm25_candidates_requested\":%u,"
+						 "\"bm25_candidates_effective\":%u,"
+						 "\"bm25_k_defaulted\":%s,"
+						 "\"bm25_candidates\":%u,"
+						 "\"rrf_k_requested\":%u,"
+						 "\"rrf_k_effective\":%u,"
+						 "\"rrf_k_defaulted\":%s,"
+						 "\"auto_budget_limit\":%u,"
+						 "\"union_candidates\":%u,"
 					 "\"final_results\":%u,"
 					 "\"fusion_strategy\":\"%s\","
 					 "\"fusion_candidates_seen\":%u,"
@@ -1547,6 +1895,15 @@ hybrid_last_scan_stats(PG_FUNCTION_ARGS)
 					 "\"graph_visited_nodes\":" UINT64_FORMAT ","
 					 "\"graph_scored_codes\":" UINT64_FORMAT ","
 					 "\"graph_exact_rescore_count\":" UINT64_FORMAT ","
+					 "\"dense_prepare_us\":" UINT64_FORMAT ","
+					 "\"dense_traverse_us\":" UINT64_FORMAT ","
+					 "\"dense_entry_us\":" UINT64_FORMAT ","
+					 "\"dense_base_us\":" UINT64_FORMAT ","
+					 "\"dense_batch_us\":" UINT64_FORMAT ","
+					 "\"dense_heap_us\":" UINT64_FORMAT ","
+					 "\"dense_fill_us\":" UINT64_FORMAT ","
+					 "\"dense_rescore_us\":" UINT64_FORMAT ","
+					 "\"dense_sort_us\":" UINT64_FORMAT ","
 					 "\"bm25_terms\":%u,"
 					 "\"bm25_postings_decoded\":" UINT64_FORMAT ","
 					 "\"bm25_blocks_visited\":" UINT64_FORMAT ","
@@ -1567,6 +1924,17 @@ hybrid_last_scan_stats(PG_FUNCTION_ARGS)
 					 "\"bm25_wand_threshold_updates\":" UINT64_FORMAT ","
 					 "\"bm25_wand_active_sorts\":" UINT64_FORMAT ","
 					 "\"bm25_wand_heap_replacements\":" UINT64_FORMAT ","
+					 "\"bm25_strategy\":\"%s\","
+					 "\"bm25_strategy_guc\":\"%s\","
+					 "\"bm25_impact_terms\":%u,"
+					 "\"bm25_impact_postings_read\":" UINT64_FORMAT ","
+					 "\"bm25_impact_full_postings_avoided\":%s,"
+					 "\"bm25_accumulator_mode\":\"%s\","
+					 "\"bm25_accumulator_hash_lookups\":" UINT64_FORMAT ","
+					 "\"bm25_accumulator_dense_updates\":" UINT64_FORMAT ","
+					 "\"bm25_final_heap_replacements\":" UINT64_FORMAT ","
+					 "\"bm25_final_sorted_count\":%u,"
+					 "\"bm25_full_sort_avoided\":%s,"
 					 "\"bm25_decode_kernel\":\"%s\","
 					 "\"bm25_score_kernel\":\"%s\","
 					 "\"bm25_simd_force\":\"%s\","
@@ -1578,13 +1946,28 @@ hybrid_last_scan_stats(PG_FUNCTION_ARGS)
 					 "\"bm25_elapsed_us\":" UINT64_FORMAT ","
 					 "\"fusion_elapsed_us\":" UINT64_FORMAT ","
 					 "\"elapsed_us\":" UINT64_FORMAT "}",
-					 tqhybrid_last_scan_stats.fusion[0] != '\0' ?
-					 tqhybrid_last_scan_stats.fusion : "none",
-					 tqhybrid_last_scan_stats.denseCandidatesRequested,
-					 tqhybrid_last_scan_stats.denseCandidates,
-					 tqhybrid_last_scan_stats.bm25CandidatesRequested,
-					 tqhybrid_last_scan_stats.bm25Candidates,
-					 tqhybrid_last_scan_stats.unionCandidates,
+						 tqhybrid_last_scan_stats.fusion[0] != '\0' ?
+						 tqhybrid_last_scan_stats.fusion : "none",
+						 tqhybrid_last_scan_stats.denseCandidatesRequested,
+						 tqhybrid_last_scan_stats.denseCandidatesEffective,
+						 tqhybrid_last_scan_stats.denseKDefaulted ? "true" : "false",
+						 tqhybrid_last_scan_stats.denseCandidates,
+					 tqhybrid_last_scan_stats.denseEffectiveResultTarget,
+					 tqhybrid_last_scan_stats.denseEffectiveSearchEf,
+					 tqhybrid_last_scan_stats.denseEffectiveRescoreBand,
+					 tqhybrid_last_scan_stats.denseHighdimWideningMultiplier,
+					 TqGraphDenseWideningReasonName(tqhybrid_last_scan_stats.denseWideningReason),
+						 TqGraphDenseBudgetPolicyNameExternal(tqhybrid_last_scan_stats.denseBudgetPolicy),
+						 TqGraphRescoreBandPolicyNameExternal(tqhybrid_last_scan_stats.denseRescoreBandPolicy),
+						 tqhybrid_last_scan_stats.bm25CandidatesRequested,
+						 tqhybrid_last_scan_stats.bm25CandidatesEffective,
+						 tqhybrid_last_scan_stats.bm25KDefaulted ? "true" : "false",
+						 tqhybrid_last_scan_stats.bm25Candidates,
+						 tqhybrid_last_scan_stats.rrfKRequested,
+						 tqhybrid_last_scan_stats.rrfKEffective,
+						 tqhybrid_last_scan_stats.rrfKDefaulted ? "true" : "false",
+						 tqhybrid_last_scan_stats.autoBudgetLimit,
+						 tqhybrid_last_scan_stats.unionCandidates,
 					 tqhybrid_last_scan_stats.finalResults,
 					 tqhybrid_last_scan_stats.fusionStrategy[0] != '\0' ?
 					 tqhybrid_last_scan_stats.fusionStrategy : "none",
@@ -1596,6 +1979,15 @@ hybrid_last_scan_stats(PG_FUNCTION_ARGS)
 					 tqhybrid_last_scan_stats.graphVisitedNodes,
 					 tqhybrid_last_scan_stats.graphScoredCodes,
 					 tqhybrid_last_scan_stats.graphExactRescoreCount,
+					 tqhybrid_last_scan_stats.graphPrepareUs,
+					 tqhybrid_last_scan_stats.graphTraverseUs,
+					 tqhybrid_last_scan_stats.graphEntryUs,
+					 tqhybrid_last_scan_stats.graphBaseUs,
+					 tqhybrid_last_scan_stats.graphBatchUs,
+					 tqhybrid_last_scan_stats.graphHeapUs,
+					 tqhybrid_last_scan_stats.graphFillUs,
+					 tqhybrid_last_scan_stats.graphRescoreUs,
+					 tqhybrid_last_scan_stats.graphSortUs,
 					 tqhybrid_last_scan_stats.bm25Terms,
 					 tqhybrid_last_scan_stats.bm25PostingsDecoded,
 					 tqhybrid_last_scan_stats.bm25BlocksVisited,
@@ -1616,6 +2008,17 @@ hybrid_last_scan_stats(PG_FUNCTION_ARGS)
 					 tqhybrid_last_scan_stats.bm25WandThresholdUpdates,
 					 tqhybrid_last_scan_stats.bm25WandActiveSorts,
 					 tqhybrid_last_scan_stats.bm25WandHeapReplacements,
+					 TqHybridBm25RuntimeStrategyName(tqhybrid_last_scan_stats.bm25Strategy),
+					 TqHybridBm25StrategyName(tqhybrid_bm25_strategy),
+					 tqhybrid_last_scan_stats.bm25ImpactTerms,
+					 tqhybrid_last_scan_stats.bm25ImpactPostingsRead,
+					 tqhybrid_last_scan_stats.bm25ImpactFullPostingsAvoided ? "true" : "false",
+					 TqHybridBm25AccumulatorModeName(tqhybrid_last_scan_stats.bm25AccumulatorMode),
+					 tqhybrid_last_scan_stats.bm25AccumulatorHashLookups,
+					 tqhybrid_last_scan_stats.bm25AccumulatorDenseUpdates,
+					 tqhybrid_last_scan_stats.bm25FinalHeapReplacements,
+					 tqhybrid_last_scan_stats.bm25FinalSortedCount,
+					 tqhybrid_last_scan_stats.bm25FullSortAvoided ? "true" : "false",
 					 TqHybridBm25KernelName(tqhybrid_last_scan_stats.bm25DecodeKernel),
 					 TqHybridBm25KernelName(tqhybrid_last_scan_stats.bm25ScoreKernel),
 					 TqHybridBm25SimdForceName(tqhybrid_bm25_simd_force),

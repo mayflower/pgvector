@@ -467,13 +467,31 @@ hybrid_query(PG_FUNCTION_ARGS)
 		flags |= HYBRID_QUERY_FLAG_ALPHA_IS_SET;
 	}
 
-	rrfK = PG_ARGISNULL(6) ? tqhybrid_default_rrf_k : PG_GETARG_INT32(6);
+	if (PG_ARGISNULL(6))
+	{
+		rrfK = tqhybrid_default_rrf_k;
+		flags |= HYBRID_QUERY_FLAG_RRF_K_DEFAULTED;
+	}
+	else
+		rrfK = PG_GETARG_INT32(6);
 	HybridQueryCheckPositiveInt("rrf_k", rrfK);
 
-	denseK = PG_ARGISNULL(7) ? tqhybrid_default_dense_k : PG_GETARG_INT32(7);
+	if (PG_ARGISNULL(7))
+	{
+		denseK = tqhybrid_default_dense_k;
+		flags |= HYBRID_QUERY_FLAG_DENSE_K_DEFAULTED;
+	}
+	else
+		denseK = PG_GETARG_INT32(7);
 	HybridQueryCheckNonNegativeInt("dense_k", denseK);
 
-	bm25K = PG_ARGISNULL(8) ? tqhybrid_default_bm25_k : PG_GETARG_INT32(8);
+	if (PG_ARGISNULL(8))
+	{
+		bm25K = tqhybrid_default_bm25_k;
+		flags |= HYBRID_QUERY_FLAG_BM25_K_DEFAULTED;
+	}
+	else
+		bm25K = PG_GETARG_INT32(8);
 	HybridQueryCheckNonNegativeInt("bm25_k", bm25K);
 
 	if (!PG_ARGISNULL(9))

@@ -62,8 +62,10 @@ typedef struct TqHybridBm25Collector
 	BlockNumber bm25LexiconStartBlkno;
 	BlockNumber bm25PostingsStartBlkno;
 	BlockNumber bm25BlockMaxStartBlkno;
+	BlockNumber bm25ImpactStartBlkno;
 	uint32		bm25PostingsPages;
 	uint32		bm25BlockMaxPages;
+	uint32		bm25ImpactPages;
 	Size		softBudget;
 	bool		allowSpill;
 	bool		walLoggedWrites;
@@ -462,11 +464,73 @@ TqHybridBm25LexiconEntrySize(uint16 termLen)
 }
 
 static Size
+TqHybridBm25ImpactTupleSize(uint16 count)
+{
+	return MAXALIGN(offsetof(TqHybridBm25ImpactTupleData, entries) +
+					sizeof(TqHybridBm25ImpactTupleEntry) * count);
+}
+
+static Size
 TqHybridBm25DeltaTupleSize(uint16 termCount, uint32 termBytesLen)
 {
 	return MAXALIGN(offsetof(TqHybridBm25DeltaTupleData, terms) +
 					sizeof(TqHybridBm25DeltaTerm) * termCount +
 					termBytesLen);
+}
+
+static bool
+TqHybridBm25ImpactHeadEnabled(TqHybridBm25Collector *collector,
+							  uint32 *minDf, uint32 *headK)
+{
+	TqHybridOptions *opts = (TqHybridOptions *) collector->index->rd_options;
+
+	if (opts != NULL)
+	{
+		*minDf = (uint32) Max(opts->bm25ImpactMinDf, 1);
+		*headK = (uint32) Max(opts->bm25ImpactHeadK, 1);
+		return opts->bm25ImpactHead;
+	}
+	*minDf = 1024;
+	*headK = 2048;
+	return true;
+}
+
+static double
+TqHybridBm25BuildPostingScore(TqHybridBm25Collector *collector,
+							  uint32 nodeId, uint16 tf)
+{
+	TqHybridOptions *opts = (TqHybridOptions *) collector->index->rd_options;
+	double		k1 = opts != NULL ? opts->bm25K1 : 1.2;
+	double		b = opts != NULL ? opts->bm25B : 0.75;
+	double		avgDocLen = collector->docCount == 0 ? 1.0 :
+		(double) collector->totalDocLen / (double) collector->docCount;
+	double		docLen = 1.0;
+	double		norm;
+
+	if (collector->denseDocLens != NULL && nodeId < collector->denseDocLensCount &&
+		collector->denseDocLens[nodeId] > 0)
+		docLen = (double) collector->denseDocLens[nodeId];
+	norm = k1 * (1.0 - b + b * docLen / Max(avgDocLen, 1.0));
+	return ((double) tf * (k1 + 1.0)) / ((double) tf + norm);
+}
+
+static int
+TqHybridBm25ImpactTupleEntryCompare(const void *a, const void *b)
+{
+	const TqHybridBm25ImpactTupleEntry *ia =
+		(const TqHybridBm25ImpactTupleEntry *) a;
+	const TqHybridBm25ImpactTupleEntry *ib =
+		(const TqHybridBm25ImpactTupleEntry *) b;
+
+	if (ia->score < ib->score)
+		return 1;
+	if (ia->score > ib->score)
+		return -1;
+	if (ia->nodeId < ib->nodeId)
+		return -1;
+	if (ia->nodeId > ib->nodeId)
+		return 1;
+	return 0;
 }
 
 static int
@@ -1289,6 +1353,8 @@ TqHybridBm25AddItem(Relation index, ForkNumber forkNum, Buffer *buf, Page *page,
 	if (offno == InvalidOffsetNumber)
 		elog(ERROR, "failed to add turbohybrid BM25 item to \"%s\"",
 			 RelationGetRelationName(index));
+	HnswMarkPageGraphOp(*page, HNSW_GRAPH_OP_ELEMENT_INSERT);
+	MarkBufferDirty(*buf);
 
 	if (insertBlkno != NULL)
 		*insertBlkno = BufferGetBlockNumber(*buf);
@@ -1522,6 +1588,67 @@ TqHybridLinkPostingsChunk(Relation index, Buffer currentBuf, Page currentPage,
 		UnlockReleaseBuffer(buf);
 }
 
+static void
+TqHybridLinkImpactChunk(Relation index, Buffer currentBuf, Page currentPage,
+						BlockNumber prevBlkno, OffsetNumber prevOffno,
+						BlockNumber nextBlkno, OffsetNumber nextOffno)
+{
+	Buffer		buf;
+	Page		page;
+	ItemId		iid;
+	TqHybridBm25ImpactTuple tuple;
+	GenericXLogState *xlogState = NULL;
+	bool		modified = false;
+	bool		current = BufferIsValid(currentBuf) &&
+		BufferGetBlockNumber(currentBuf) == prevBlkno;
+
+	if (current)
+	{
+		buf = currentBuf;
+		page = currentPage;
+	}
+	else
+	{
+		buf = ReadBuffer(index, prevBlkno);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+	}
+
+	if (RelationNeedsWAL(index))
+	{
+		xlogState = GenericXLogStart(index);
+		page = GenericXLogRegisterBuffer(xlogState, buf, 0);
+	}
+
+	if (prevOffno <= PageGetMaxOffsetNumber(page))
+	{
+		iid = PageGetItemId(page, prevOffno);
+		if (ItemIdIsUsed(iid))
+		{
+			tuple = (TqHybridBm25ImpactTuple) PageGetItem(page, iid);
+			if (tuple->type == TQHYBRID_BM25_IMPACT_TUPLE_TYPE)
+			{
+				tuple->nextBlkno = nextBlkno;
+				tuple->nextOffno = nextOffno;
+				modified = true;
+			}
+		}
+	}
+
+	if (xlogState != NULL)
+	{
+		if (modified)
+			GenericXLogFinish(xlogState);
+		else
+			GenericXLogAbort(xlogState);
+	}
+	else if (modified)
+		MarkBufferDirty(buf);
+
+	if (!current)
+		UnlockReleaseBuffer(buf);
+}
+
 static OffsetNumber
 TqHybridWritePostings(TqHybridBm25Collector *collector, uint32 termId,
 					  uint32 startIndex, uint32 endIndex,
@@ -1652,11 +1779,21 @@ TqHybridWritePostingsChunkData(TqHybridBm25Collector *collector, uint32 termId,
 	}
 	if (hasTfNorm)
 	{
+		TqHybridOptions *opts = (TqHybridOptions *) collector->index->rd_options;
+		double		k1 = opts != NULL ? opts->bm25K1 : 1.2;
+
 		for (uint16 i = 0; i < count; i++)
-			TqHybridBm25PutUint16(&ptr,
-								  TqHybridBm25QuantizeTfNorm(collector,
-															 postings[i].nodeId,
-															 postings[i].tf));
+		{
+			uint16		tfNormQ16 = TqHybridBm25QuantizeTfNorm(collector,
+															  postings[i].nodeId,
+															  postings[i].tf);
+
+			tuple->maxTfNormQ16 = Max(tuple->maxTfNormQ16, tfNormQ16);
+			TqHybridBm25PutUint16(&ptr, tfNormQ16);
+		}
+		tuple->maxScoreFactor =
+			(float4) (Max(k1 + 1.0, 1.0) *
+					  ((double) tuple->maxTfNormQ16 / (double) PG_UINT16_MAX));
 	}
 
 	offno = TqHybridBm25AddItem(collector->index, MAIN_FORKNUM, buf, page,
@@ -1670,6 +1807,88 @@ TqHybridWritePostingsChunkData(TqHybridBm25Collector *collector, uint32 termId,
 	*postingsBytes = size;
 	pfree(tuple);
 	return offno;
+}
+
+static OffsetNumber
+TqHybridWriteImpactHead(TqHybridBm25Collector *collector, uint32 termId,
+						TqHybridBm25ImpactTupleEntry *entries,
+						uint32 entryCount, uint32 df,
+						Buffer *buf, Page *page,
+						BlockNumber *impactBlkno, uint16 *impactCount)
+{
+	uint32		minDf;
+	uint32		headK;
+	uint32		maxPerTuple;
+	uint32		totalCount;
+	uint32		written = 0;
+	OffsetNumber firstOffno = InvalidOffsetNumber;
+	BlockNumber firstBlkno = InvalidBlockNumber;
+	BlockNumber prevBlkno = InvalidBlockNumber;
+	OffsetNumber prevOffno = InvalidOffsetNumber;
+	double		corpusDocCount = Max((double) collector->docCount, 1.0);
+	double		idf;
+
+	*impactBlkno = InvalidBlockNumber;
+	*impactCount = 0;
+	if (!TqHybridBm25ImpactHeadEnabled(collector, &minDf, &headK) ||
+		df < minDf || entryCount == 0)
+		return InvalidOffsetNumber;
+
+	idf = log(1.0 + (corpusDocCount - (double) df + 0.5) /
+			  ((double) df + 0.5));
+	for (uint32 i = 0; i < entryCount; i++)
+		entries[i].score *= (float4) idf;
+
+	qsort(entries, entryCount, sizeof(TqHybridBm25ImpactTupleEntry),
+		  TqHybridBm25ImpactTupleEntryCompare);
+	maxPerTuple = (BLCKSZ / 2 - offsetof(TqHybridBm25ImpactTupleData, entries)) /
+		sizeof(TqHybridBm25ImpactTupleEntry);
+	totalCount = Min(entryCount, headK);
+	totalCount = Min(totalCount, (uint32) PG_UINT16_MAX);
+	while (written < totalCount)
+	{
+		uint16		count = (uint16) Min(maxPerTuple, totalCount - written);
+		Size		size = TqHybridBm25ImpactTupleSize(count);
+		TqHybridBm25ImpactTuple tuple;
+		OffsetNumber offno;
+		BlockNumber insertBlkno = InvalidBlockNumber;
+
+		tuple = palloc0(size);
+		tuple->type = TQHYBRID_BM25_IMPACT_TUPLE_TYPE;
+		tuple->count = count;
+		tuple->termId = termId;
+		tuple->nextBlkno = InvalidBlockNumber;
+		tuple->nextOffno = InvalidOffsetNumber;
+		memcpy(tuple->entries, entries + written,
+			   sizeof(TqHybridBm25ImpactTupleEntry) * count);
+
+		offno = TqHybridBm25AddItem(collector->index, MAIN_FORKNUM, buf, page,
+									&collector->bm25ImpactStartBlkno,
+									HNSW_PAGE_KIND_TQ_BM25_IMPACT,
+									(Item) tuple, size,
+									&collector->bm25ImpactPages,
+									collector->walLoggedWrites,
+									&insertBlkno);
+		pfree(tuple);
+
+		if (!OffsetNumberIsValid(firstOffno))
+		{
+			firstOffno = offno;
+			firstBlkno = insertBlkno;
+		}
+		if (BlockNumberIsValid(prevBlkno))
+			TqHybridLinkImpactChunk(collector->index, *buf, *page,
+									prevBlkno, prevOffno,
+									insertBlkno, offno);
+
+		prevBlkno = insertBlkno;
+		prevOffno = offno;
+		written += count;
+	}
+
+	*impactBlkno = firstBlkno;
+	*impactCount = (uint16) totalCount;
+	return firstOffno;
 }
 
 static OffsetNumber
@@ -1890,7 +2109,10 @@ TqHybridWriteLexiconItem(TqHybridBm25Collector *collector,
 						 OffsetNumber postingsOffno,
 						 uint32 postingsChunkCount, uint32 postingsBytes,
 						 BlockNumber blockMaxBlkno,
-						 OffsetNumber blockMaxOffno)
+						 OffsetNumber blockMaxOffno,
+						 BlockNumber impactBlkno,
+						 OffsetNumber impactOffno,
+						 uint16 impactCount)
 {
 	Size		lexSize = TqHybridBm25LexiconEntrySize(termLen);
 	TqHybridBm25LexiconEntry lex = palloc0(lexSize);
@@ -1907,6 +2129,9 @@ TqHybridWriteLexiconItem(TqHybridBm25Collector *collector,
 	lex->postingsBytes = postingsBytes;
 	lex->blockMaxBlkno = blockMaxBlkno;
 	lex->blockMaxOffno = blockMaxOffno;
+	lex->impactBlkno = impactBlkno;
+	lex->impactOffno = impactOffno;
+	lex->impactCount = impactCount;
 	memcpy(lex->termBytes, termBytes, termLen);
 
 	(void) TqHybridBm25AddItem(collector->index, MAIN_FORKNUM,
@@ -1926,6 +2151,8 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 	Page		postingsPage = NULL;
 	Buffer		blockMaxBuf = InvalidBuffer;
 	Page		blockMaxPage = NULL;
+	Buffer		impactBuf = InvalidBuffer;
+	Page		impactPage = NULL;
 	BlockNumber lexStart = InvalidBlockNumber;
 	TqHybridBm25SpillCursor *cursors;
 	TqHybridBm25SpillHeap heap;
@@ -1969,6 +2196,12 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 		OffsetNumber prevPostingsOffno = InvalidOffsetNumber;
 		BlockNumber blockMaxBlkno;
 		OffsetNumber blockMaxOffno;
+		BlockNumber impactBlkno;
+		OffsetNumber impactOffno;
+		uint16		impactCount;
+		TqHybridBm25ImpactTupleEntry *impactEntries = NULL;
+		uint32		impactEntryCount = 0;
+		uint32		impactEntryCapacity = 0;
 		uint32		firstNodeId = PG_UINT32_MAX;
 		uint32		lastNodeId = 0;
 
@@ -1995,6 +2228,24 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 			}
 			cf += tf;
 			maxTf = Max(maxTf, tf);
+			if (impactEntryCount >= impactEntryCapacity)
+			{
+				impactEntryCapacity = impactEntryCapacity == 0 ? 64 :
+					impactEntryCapacity * 2;
+				impactEntries = impactEntries == NULL ?
+					palloc(sizeof(TqHybridBm25ImpactTupleEntry) *
+						   impactEntryCapacity) :
+					repalloc(impactEntries,
+							 sizeof(TqHybridBm25ImpactTupleEntry) *
+							 impactEntryCapacity);
+			}
+			impactEntries[impactEntryCount].nodeId = nodeId;
+			impactEntries[impactEntryCount].tfNormQ16 =
+				TqHybridBm25QuantizeTfNorm(collector, nodeId, tf);
+			impactEntries[impactEntryCount].reserved = 0;
+			impactEntries[impactEntryCount].score =
+				(float4) TqHybridBm25BuildPostingScore(collector, nodeId, tf);
+			impactEntryCount++;
 			if (firstNodeId == PG_UINT32_MAX)
 				firstNodeId = nodeId;
 			lastNodeId = nodeId;
@@ -2072,11 +2323,18 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 												  maxTf, &blockMaxBuf,
 												  &blockMaxPage,
 												  &blockMaxBlkno);
+		impactOffno = TqHybridWriteImpactHead(collector, termId,
+											  impactEntries, impactEntryCount,
+											  df, &impactBuf, &impactPage,
+											  &impactBlkno, &impactCount);
 		TqHybridWriteLexiconItem(collector, &lexBuf, &lexPage, &lexStart,
 								 termId, termHash, termBytes, termLen, df, cf,
 								 firstPostingsBlkno, firstPostingsOffno,
 								 postingsChunkCount, postingsBytes,
-								 blockMaxBlkno, blockMaxOffno);
+								 blockMaxBlkno, blockMaxOffno,
+								 impactBlkno, impactOffno, impactCount);
+		if (impactEntries != NULL)
+			pfree(impactEntries);
 		pfree(termBytes);
 		termId++;
 		CHECK_FOR_INTERRUPTS();
@@ -2094,6 +2352,8 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 		UnlockReleaseBuffer(postingsBuf);
 	if (BufferIsValid(blockMaxBuf))
 		UnlockReleaseBuffer(blockMaxBuf);
+	if (BufferIsValid(impactBuf))
+		UnlockReleaseBuffer(impactBuf);
 
 	collector->bm25LexiconStartBlkno = lexStart;
 	collector->uniqueTerms = termId;
@@ -2108,6 +2368,8 @@ TqHybridWriteLexiconAndPostings(TqHybridBm25Collector *collector)
 	Page		postingsPage = NULL;
 	Buffer		blockMaxBuf = InvalidBuffer;
 	Page		blockMaxPage = NULL;
+	Buffer		impactBuf = InvalidBuffer;
+	Page		impactPage = NULL;
 	BlockNumber lexStart = InvalidBlockNumber;
 	uint32		termId = 0;
 
@@ -2130,6 +2392,11 @@ TqHybridWriteLexiconAndPostings(TqHybridBm25Collector *collector)
 		uint32		postingsChunkCount;
 		BlockNumber blockMaxBlkno;
 		OffsetNumber blockMaxOffno;
+		BlockNumber impactBlkno;
+		OffsetNumber impactOffno;
+		uint16		impactCount;
+		TqHybridBm25ImpactTupleEntry *impactEntries;
+		uint32		impactEntryCount;
 
 		while (i < collector->termCount &&
 			   TqHybridTermEqualIgnoringNode(first, &collector->terms[i],
@@ -2151,13 +2418,37 @@ TqHybridWriteLexiconAndPostings(TqHybridBm25Collector *collector)
 		blockMaxOffno = TqHybridWriteBlockMax(collector, termId, startIndex, i,
 											  &blockMaxBuf, &blockMaxPage,
 											  &blockMaxBlkno);
+		impactEntryCount = i - startIndex;
+		impactEntries = palloc(sizeof(TqHybridBm25ImpactTupleEntry) *
+							   Max(impactEntryCount, 1));
+		for (uint32 j = startIndex; j < i; j++)
+		{
+			TqHybridBm25TermTuple *term = &collector->terms[j];
+			TqHybridBm25ImpactTupleEntry *impact =
+				&impactEntries[j - startIndex];
+
+			impact->nodeId = term->nodeId;
+			impact->tfNormQ16 = TqHybridBm25QuantizeTfNorm(collector,
+														   term->nodeId,
+														   term->tf);
+			impact->reserved = 0;
+			impact->score = (float4) TqHybridBm25BuildPostingScore(collector,
+																	term->nodeId,
+																	term->tf);
+		}
+		impactOffno = TqHybridWriteImpactHead(collector, termId,
+											  impactEntries, impactEntryCount,
+											  df, &impactBuf, &impactPage,
+											  &impactBlkno, &impactCount);
+		pfree(impactEntries);
 
 		TqHybridWriteLexiconItem(collector, &lexBuf, &lexPage, &lexStart,
 								 termId, first->termHash,
 								 collector->termBytes + first->termOffset,
 								 first->termLen, df, cf, postingsBlkno,
 								 postingsOffno, postingsChunkCount,
-								 postingsBytes, blockMaxBlkno, blockMaxOffno);
+								 postingsBytes, blockMaxBlkno, blockMaxOffno,
+								 impactBlkno, impactOffno, impactCount);
 		termId++;
 	}
 
@@ -2167,6 +2458,8 @@ TqHybridWriteLexiconAndPostings(TqHybridBm25Collector *collector)
 		UnlockReleaseBuffer(postingsBuf);
 	if (BufferIsValid(blockMaxBuf))
 		UnlockReleaseBuffer(blockMaxBuf);
+	if (BufferIsValid(impactBuf))
+		UnlockReleaseBuffer(impactBuf);
 
 	collector->bm25LexiconStartBlkno = lexStart;
 	collector->uniqueTerms = termId;
@@ -2185,6 +2478,8 @@ TqHybridWriteMeta(TqHybridBm25Collector *collector)
 	tuple.type = TQHYBRID_BM25_META_TUPLE_TYPE;
 	if (opts == NULL || opts->bm25PrecomputeTfNorm)
 		tuple.reserved2 |= TQHYBRID_BM25_META_FLAG_TFNORM_Q16;
+	if (collector->bm25ImpactPages > 0)
+		tuple.reserved2 |= TQHYBRID_BM25_META_FLAG_IMPACT_HEAD;
 	tuple.bm25Version = TQHYBRID_BM25_VERSION;
 	tuple.docCount = collector->docCount;
 	tuple.totalDocLen = collector->totalDocLen;
@@ -2199,6 +2494,7 @@ TqHybridWriteMeta(TqHybridBm25Collector *collector)
 	tuple.lexiconStartBlkno = collector->bm25LexiconStartBlkno;
 	tuple.postingsStartBlkno = collector->bm25PostingsStartBlkno;
 	tuple.blockMaxStartBlkno = collector->bm25BlockMaxStartBlkno;
+	tuple.impactStartBlkno = collector->bm25ImpactStartBlkno;
 	tuple.deltaStartBlkno = InvalidBlockNumber;
 	tuple.deltaGeneration = 0;
 	tuple.deltaDocCount = 0;
@@ -2206,6 +2502,7 @@ TqHybridWriteMeta(TqHybridBm25Collector *collector)
 	tuple.deltaTermCount = 0;
 	tuple.postingsPages = collector->bm25PostingsPages;
 	tuple.blockMaxPages = collector->bm25BlockMaxPages;
+	tuple.impactPages = collector->bm25ImpactPages;
 	tuple.deltaPages = 0;
 	tuple.lastCompactionGeneration = 0;
 	tuple.compactionCount = 0;
@@ -2533,6 +2830,10 @@ TqHybridBm25UpdateCompactedMeta(Relation index,
 		metaTuple->reserved2 |= TQHYBRID_BM25_META_FLAG_TFNORM_Q16;
 	else
 		metaTuple->reserved2 &= ~TQHYBRID_BM25_META_FLAG_TFNORM_Q16;
+	if (collector->bm25ImpactPages > 0)
+		metaTuple->reserved2 |= TQHYBRID_BM25_META_FLAG_IMPACT_HEAD;
+	else
+		metaTuple->reserved2 &= ~TQHYBRID_BM25_META_FLAG_IMPACT_HEAD;
 	metaTuple->totalDocLen = collector->totalDocLen;
 	metaTuple->avgDocLen = collector->docCount == 0 ? 0.0f :
 		(float4) ((double) collector->totalDocLen / (double) collector->docCount);
@@ -2543,6 +2844,7 @@ TqHybridBm25UpdateCompactedMeta(Relation index,
 	metaTuple->lexiconStartBlkno = collector->bm25LexiconStartBlkno;
 	metaTuple->postingsStartBlkno = collector->bm25PostingsStartBlkno;
 	metaTuple->blockMaxStartBlkno = collector->bm25BlockMaxStartBlkno;
+	metaTuple->impactStartBlkno = collector->bm25ImpactStartBlkno;
 	metaTuple->deltaStartBlkno = InvalidBlockNumber;
 	metaTuple->deltaGeneration = oldMeta->deltaGeneration + 1;
 	metaTuple->deltaDocCount = 0;
@@ -2550,6 +2852,7 @@ TqHybridBm25UpdateCompactedMeta(Relation index,
 	metaTuple->deltaTermCount = 0;
 	metaTuple->postingsPages = collector->bm25PostingsPages;
 	metaTuple->blockMaxPages = collector->bm25BlockMaxPages;
+	metaTuple->impactPages = collector->bm25ImpactPages;
 	metaTuple->deltaPages = 0;
 	metaTuple->lastCompactionGeneration = metaTuple->deltaGeneration;
 	metaTuple->compactionCount = oldMeta->compactionCount + 1;
@@ -3346,12 +3649,14 @@ tq_debug_bm25_stats(PG_FUNCTION_ARGS)
 					 "\"lexicon_start_blkno\":%u,"
 					 "\"postings_start_blkno\":%u,"
 					 "\"blockmax_start_blkno\":%u,"
+					 "\"impact_start_blkno\":%u,"
 					 "\"delta_start_blkno\":%u,"
 					 "\"delta_generation\":" UINT64_FORMAT ","
 					 "\"delta_doc_count\":%u,"
 					 "\"delta_term_count\":%u,"
 					 "\"postings_pages\":%u,"
 					 "\"blockmax_pages\":%u,"
+					 "\"impact_pages\":%u,"
 					 "\"delta_pages\":%u,"
 					 "\"last_compaction_generation\":" UINT64_FORMAT ","
 					 "\"compaction_count\":%u}",
@@ -3371,12 +3676,14 @@ tq_debug_bm25_stats(PG_FUNCTION_ARGS)
 					 meta.lexiconStartBlkno,
 					 meta.postingsStartBlkno,
 					 meta.blockMaxStartBlkno,
+					 meta.impactStartBlkno,
 					 meta.deltaStartBlkno,
 					 meta.deltaGeneration,
 					 meta.deltaDocCount,
 					 meta.deltaTermCount,
 					 meta.postingsPages,
 					 meta.blockMaxPages,
+					 meta.impactPages,
 					 meta.deltaPages,
 					 meta.lastCompactionGeneration,
 					 meta.compactionCount);
@@ -3440,7 +3747,11 @@ tq_debug_bm25_term_stats(PG_FUNCTION_ARGS)
 					 "\"unknown\":%u},"
 					 "\"bm25_precompute_tf_norm\":%s,"
 					 "\"blockmax_blkno\":%u,"
-					 "\"blockmax_offno\":%u}",
+					 "\"blockmax_offno\":%u,"
+					 "\"impact_blkno\":%u,"
+					 "\"impact_offno\":%u,"
+					 "\"impact_count\":%u,"
+					 "\"bm25_impact_head_stored\":%s}",
 					 entry.termId,
 					 entry.df,
 						 entry.cf,
@@ -3457,7 +3768,12 @@ tq_debug_bm25_term_stats(PG_FUNCTION_ARGS)
 					 (meta.reserved2 & TQHYBRID_BM25_META_FLAG_TFNORM_Q16) != 0 ?
 					 "true" : "false",
 					 entry.blockMaxBlkno,
-					 entry.blockMaxOffno);
+					 entry.blockMaxOffno,
+					 entry.impactBlkno,
+					 entry.impactOffno,
+					 entry.impactCount,
+					 OffsetNumberIsValid(entry.impactOffno) &&
+					 BlockNumberIsValid(entry.impactBlkno) ? "true" : "false");
 
 	index_close(index, AccessShareLock);
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data)));

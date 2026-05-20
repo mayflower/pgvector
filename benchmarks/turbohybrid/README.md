@@ -178,6 +178,24 @@ python3 benchmarks/turbohybrid/suite.py run-simd-profile \
   --output /tmp/turbohybrid_simd_scalar.json
 ```
 
+For engine timing, prefer the in-backend profiler. It keeps one PostgreSQL
+backend session open, runs each query shape in a PL/pgSQL loop, and reports
+microsecond latency from `clock_timestamp()` separately from optional legacy
+`psql` subprocess timing:
+
+```sh
+python3 benchmarks/turbohybrid/suite.py profile-inbackend \
+  --database contrib_regression \
+  --rows 100000 \
+  --dimensions 1536 \
+  --k 100 \
+  --final-k 10 \
+  --runs 1000 \
+  --warmup-runs 10 \
+  --cli-runs 10 \
+  --output /tmp/turbohybrid_profile_inbackend.json
+```
+
 On Linux hosts, `--perf-command` can wrap each measured psql query, for example:
 
 ```sh
@@ -350,14 +368,22 @@ warnings.
 To produce 10k-row and 100k-row baseline reports with custom run settings, use:
 
 ```sh
-python3 benchmarks/turbohybrid/suite.py acceptance \
+python3 benchmarks/turbohybrid/suite.py engine-speed \
   --database contrib_regression \
   --profile full \
   --rows-list 10000,100000 \
+  --dimensions 1536 \
+  --k 100 \
+  --final-k 100 \
   --runs 30 \
-  --concurrency 1,4,16 \
   --output-dir benchmarks/turbohybrid/results
 ```
+
+`engine-speed` writes `engine_speed_<commit>_<timestamp>.json` and `.md`
+reports. Its primary latency numbers are measured inside one PostgreSQL backend
+with `clock_timestamp()` loops, while optional `--cli-runs` records legacy
+`psql` subprocess latency separately. The report includes BM25 strategy/impact
+diagnostics, dense graph timer breakdowns, and build/WAL/storage tables.
 
 Run the explicit top-N fusion smoke for the prompt-07 target case
 `dense_k=5000`, `bm25_k=5000`, and `final_k=20`:

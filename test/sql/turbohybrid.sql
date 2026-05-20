@@ -74,6 +74,49 @@ SELECT
 	tq_debug_bm25_topk('tqh_docs_idx'::regclass, to_tsquery('english', 'postgres | lexical'), 5, false)->>'result_count' AS or_count,
 	tq_debug_bm25_topk('tqh_docs_idx'::regclass, websearch_to_tsquery('english', 'postgres vector'), 5, false)->>'result_count' AS websearch_count;
 
+SET hybrid.bm25_force_full_sort = on;
+CREATE TEMP TABLE tqh_bm25_full_sort_results AS
+SELECT tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+	to_tsquery('english', 'postgres | lexical'), 2, false)->'results' AS results;
+RESET hybrid.bm25_force_full_sort;
+
+WITH bounded AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+		to_tsquery('english', 'postgres | lexical'), 2, false) AS j
+)
+SELECT
+	(j->'results') = (SELECT results FROM tqh_bm25_full_sort_results) AS bounded_matches_full_sort,
+	(j->>'full_sort_avoided')::bool AS full_sort_avoided,
+	(j->>'final_sorted_count')::int <= 2 AS bounded_final_sorted
+FROM bounded;
+
+DROP TABLE tqh_bm25_full_sort_results;
+
+SET hybrid.bm25_accumulator_mode = hash;
+CREATE TEMP TABLE tqh_bm25_hash_accumulator_results AS
+SELECT
+	tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+		to_tsquery('english', 'postgres | lexical'), 3, false)->'results' AS or_results,
+	tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+		to_tsquery('english', 'postgres & vector'), 3, false)->'results' AS and_results;
+SET hybrid.bm25_accumulator_mode = node_generation_arrays;
+
+WITH dense AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+		to_tsquery('english', 'postgres | lexical'), 3, false) AS or_stats,
+		tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+		to_tsquery('english', 'postgres & vector'), 3, false) AS and_stats
+)
+SELECT
+	(or_stats->'results') = (SELECT or_results FROM tqh_bm25_hash_accumulator_results) AS dense_or_matches_hash,
+	(and_stats->'results') = (SELECT and_results FROM tqh_bm25_hash_accumulator_results) AS dense_and_matches_hash,
+	or_stats->>'accumulator_mode' AS accumulator_mode,
+	(or_stats->>'accumulator_dense_updates')::int > 0 AS has_dense_updates
+FROM dense;
+
+RESET hybrid.bm25_accumulator_mode;
+DROP TABLE tqh_bm25_hash_accumulator_results;
+
 SELECT
 	tq_debug_bm25_topk('tqh_docs_idx'::regclass, to_tsquery('english', 'search'), 2, true)->>'result_count' AS result_count,
 	tq_debug_bm25_topk('tqh_docs_idx'::regclass, to_tsquery('english', 'search'), 2, true)->>'used_wand' AS used_wand,
@@ -412,6 +455,27 @@ SELECT
 	tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'delta_doc_count' AS delta_doc_count,
 	tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'delta_term_count' AS delta_term_count;
 
+SET hybrid.bm25_cache_max_mb = 1;
+SET hybrid.bm25_accumulator_mode = hash;
+CREATE TEMP TABLE tqh_delta_hash_accumulator_results AS
+SELECT tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+	to_tsquery('english', 'new | lexical'), 3, false)->'results' AS results;
+SET hybrid.bm25_accumulator_mode = node_generation_arrays;
+
+WITH dense AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_docs_idx'::regclass,
+		to_tsquery('english', 'new | lexical'), 3, false) AS stats
+)
+SELECT
+	(stats->'results') = (SELECT results FROM tqh_delta_hash_accumulator_results) AS dense_delta_matches_hash,
+	stats->>'accumulator_mode' AS accumulator_mode,
+	(stats->>'delta_postings_decoded')::int > 0 AS decoded_delta_postings
+FROM dense;
+
+RESET hybrid.bm25_accumulator_mode;
+RESET hybrid.bm25_cache_max_mb;
+DROP TABLE tqh_delta_hash_accumulator_results;
+
 CREATE TEMP TABLE tqh_delta_cache_probe AS
 SELECT tq_debug_bm25_topk('tqh_docs_idx'::regclass, to_tsquery('english', 'new'), 3, false) AS stats;
 INSERT INTO tqh_delta_cache_probe
@@ -557,6 +621,128 @@ RESET hybrid.enable_wand;
 
 DROP TABLE tqh_wand_docs;
 
+CREATE TABLE tqh_impact_docs (
+	id int,
+	embedding vector(3),
+	body_tsv tsvector
+);
+INSERT INTO tqh_impact_docs
+SELECT i,
+	format('[%s,%s,%s]', i, i % 3, 0)::vector,
+	to_tsvector('english',
+		CASE WHEN i <= 12 THEN 'common impact' || repeat(' filler', i) ELSE 'other impact' END)
+FROM generate_series(1, 20) i;
+CREATE INDEX tqh_impact_docs_idx ON tqh_impact_docs
+USING turbohybrid (
+	embedding vector_cosine_hybrid_ops,
+	body_tsv bm25_tsvector_ops
+)
+WITH (
+	bm25_impact_head = on,
+	bm25_impact_min_df = 4,
+	bm25_impact_head_k = 8
+);
+
+SET hybrid.bm25_strategy = daat_hash;
+CREATE TEMP TABLE tqh_impact_daat AS
+SELECT tq_debug_bm25_topk('tqh_impact_docs_idx'::regclass,
+	to_tsquery('english', 'common'), 4, false)->'results' AS results;
+SET hybrid.bm25_strategy = impact;
+SELECT
+	(tq_debug_bm25_term_stats('tqh_impact_docs_idx'::regclass, 'common')->>'bm25_impact_head_stored')::bool AS stored_impact_head,
+	(tq_debug_bm25_term_stats('tqh_impact_docs_idx'::regclass, 'common')->>'impact_count')::int = 8 AS stored_impact_count;
+WITH impact AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_impact_docs_idx'::regclass,
+		to_tsquery('english', 'common'), 4, false) AS j
+)
+SELECT
+	j->>'strategy' AS strategy,
+	(j->'results') = (SELECT results FROM tqh_impact_daat) AS impact_matches_daat,
+	(j->>'impact_terms')::int = 1 AS impact_terms,
+	(j->>'impact_postings_read')::int = 4 AS bounded_impact_reads,
+	(j->>'impact_full_postings_avoided')::bool AS avoided_full_postings
+FROM impact;
+
+SET hybrid.bm25_strategy = daat_hash;
+CREATE TEMP TABLE tqh_impact_or_daat AS
+SELECT tq_debug_bm25_topk('tqh_impact_docs_idx'::regclass,
+	to_tsquery('english', 'common | impact'), 6, false)->'results' AS results;
+SET hybrid.bm25_strategy = impact;
+WITH impact AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_impact_docs_idx'::regclass,
+		to_tsquery('english', 'common | impact'), 6, true) AS j
+)
+SELECT
+	j->>'strategy' AS strategy,
+	(j->'results') = (SELECT results FROM tqh_impact_or_daat) AS impact_or_matches_daat,
+	(j->>'impact_terms')::int = 2 AS seeded_impact_terms,
+	(j->>'impact_postings_read')::int > 0 AS seeded_impact_reads
+FROM impact;
+
+INSERT INTO tqh_impact_docs VALUES
+	(21, '[21,0,0]'::vector, to_tsvector('english', 'common common common common common delta'));
+SET hybrid.bm25_strategy = daat_hash;
+CREATE TEMP TABLE tqh_impact_delta_daat AS
+SELECT tq_debug_bm25_topk('tqh_impact_docs_idx'::regclass,
+	to_tsquery('english', 'common'), 4, false)->'results' AS results;
+SET hybrid.bm25_strategy = impact;
+WITH impact AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_impact_docs_idx'::regclass,
+		to_tsquery('english', 'common'), 4, false) AS j
+)
+SELECT
+	j->>'strategy' AS strategy,
+	(j->'results') = (SELECT results FROM tqh_impact_delta_daat) AS impact_delta_matches_daat,
+	(j->>'delta_postings_decoded')::int > 0 AS impact_read_delta
+FROM impact;
+RESET hybrid.bm25_strategy;
+DROP TABLE tqh_impact_daat;
+DROP TABLE tqh_impact_or_daat;
+DROP TABLE tqh_impact_delta_daat;
+DROP TABLE tqh_impact_docs;
+
+CREATE TABLE tqh_impact_chunk_docs (
+	id int,
+	embedding vector(3),
+	body_tsv tsvector
+);
+INSERT INTO tqh_impact_chunk_docs
+SELECT i,
+	format('[%s,%s,%s]', i, i % 5, i % 7)::vector,
+	to_tsvector('english', 'chunkimpact' || repeat(' filler', i % 11))
+FROM generate_series(1, 512) i;
+CREATE INDEX tqh_impact_chunk_docs_idx ON tqh_impact_chunk_docs
+USING turbohybrid (
+	embedding vector_cosine_hybrid_ops,
+	body_tsv bm25_tsvector_ops
+)
+WITH (
+	bm25_impact_head = on,
+	bm25_impact_min_df = 4,
+	bm25_impact_head_k = 512
+);
+SELECT
+	(tq_debug_bm25_term_stats('tqh_impact_chunk_docs_idx'::regclass, 'chunkimpact')->>'bm25_impact_head_stored')::bool AS stored_chunked_head,
+	(tq_debug_bm25_term_stats('tqh_impact_chunk_docs_idx'::regclass, 'chunkimpact')->>'impact_count')::int = 512 AS stored_chunked_count;
+SET hybrid.bm25_strategy = daat_hash;
+CREATE TEMP TABLE tqh_impact_chunk_daat AS
+SELECT tq_debug_bm25_topk('tqh_impact_chunk_docs_idx'::regclass,
+	to_tsquery('english', 'chunkimpact'), 20, false)->'results' AS results;
+SET hybrid.bm25_strategy = impact;
+WITH impact AS MATERIALIZED (
+	SELECT tq_debug_bm25_topk('tqh_impact_chunk_docs_idx'::regclass,
+		to_tsquery('english', 'chunkimpact'), 20, false) AS j
+)
+SELECT
+	j->>'strategy' AS strategy,
+	(j->'results') = (SELECT results FROM tqh_impact_chunk_daat) AS chunked_impact_matches_daat,
+	(j->>'impact_postings_read')::int = 20 AS bounded_chunked_reads,
+	(j->>'impact_full_postings_avoided')::bool AS avoided_chunked_full_postings
+FROM impact;
+RESET hybrid.bm25_strategy;
+DROP TABLE tqh_impact_chunk_daat;
+DROP TABLE tqh_impact_chunk_docs;
+
 CREATE TABLE tqh_bits_docs (
 	id int,
 	embedding vector(3),
@@ -660,9 +846,36 @@ FROM (
 
 SELECT
 	hybrid_last_scan_stats()->>'dense_candidates_requested' AS dense_requested,
+	hybrid_last_scan_stats()->>'dense_candidates_effective' AS dense_effective,
+	(hybrid_last_scan_stats()->>'dense_k_defaulted')::bool AS dense_defaulted,
 	hybrid_last_scan_stats()->>'dense_candidates' AS dense_returned,
 	hybrid_last_scan_stats()->>'bm25_candidates_requested' AS bm25_requested,
+	hybrid_last_scan_stats()->>'bm25_candidates_effective' AS bm25_effective,
+	(hybrid_last_scan_stats()->>'bm25_k_defaulted')::bool AS bm25_defaulted,
 	hybrid_last_scan_stats()->>'bm25_candidates' AS bm25_returned;
+
+SELECT count(*)
+FROM (
+	SELECT id
+	FROM tqh_dense_budget_docs
+	ORDER BY embedding <~> hybrid_query(
+		vector_query => '[1,1,1]'::vector,
+		text_query => websearch_to_tsquery('english', 'absent')
+	)
+	LIMIT 3
+) s;
+
+SELECT
+	(hybrid_last_scan_stats()->>'dense_candidates_requested')::int = 400 AS dense_requested_default,
+	(hybrid_last_scan_stats()->>'dense_candidates_effective')::int = 32 AS dense_effective_limit,
+	(hybrid_last_scan_stats()->>'dense_k_defaulted')::bool AS dense_defaulted,
+	(hybrid_last_scan_stats()->>'bm25_candidates_requested')::int = 400 AS bm25_requested_default,
+	(hybrid_last_scan_stats()->>'bm25_candidates_effective')::int = 32 AS bm25_effective_limit,
+	(hybrid_last_scan_stats()->>'bm25_k_defaulted')::bool AS bm25_defaulted,
+	(hybrid_last_scan_stats()->>'rrf_k_requested')::int = 60 AS rrf_requested_default,
+	(hybrid_last_scan_stats()->>'rrf_k_effective')::int = 60 AS rrf_effective_preserved,
+	(hybrid_last_scan_stats()->>'rrf_k_defaulted')::bool AS rrf_defaulted,
+	(hybrid_last_scan_stats()->>'auto_budget_limit')::int = 3 AS detected_limit;
 
 SELECT count(*)
 FROM (
@@ -679,6 +892,8 @@ FROM (
 
 SELECT
 	hybrid_last_scan_stats()->>'dense_candidates_requested' AS dense_requested,
+	hybrid_last_scan_stats()->>'dense_candidates_effective' AS dense_effective,
+	(hybrid_last_scan_stats()->>'dense_k_defaulted')::bool AS dense_defaulted,
 	hybrid_last_scan_stats()->>'dense_candidates' AS dense_returned;
 
 SELECT count(*)
@@ -701,6 +916,87 @@ SELECT
 RESET enable_seqscan;
 
 DROP TABLE tqh_dense_budget_docs;
+
+CREATE TABLE tqh_dense_policy_docs (
+	id int,
+	embedding vector(3),
+	body_tsv tsvector
+);
+INSERT INTO tqh_dense_policy_docs
+SELECT i,
+	format('[%s,%s,%s]', i + 1, (i % 7) + 1, (i % 11) + 1)::vector,
+	to_tsvector('english', 'dense policy row')
+FROM generate_series(1, 180) i;
+
+CREATE INDEX tqh_dense_policy_idx ON tqh_dense_policy_docs
+USING turbohybrid (
+	embedding vector_cosine_hybrid_ops,
+	body_tsv bm25_tsvector_ops
+)
+WITH (
+	routing = graph,
+	graph_ef_search = 64,
+	graph_oversampling = 4
+);
+
+SET enable_seqscan = off;
+SET hnsw.tq_dense_budget_policy = latency;
+SET hnsw.tq_rescore_band_policy = limited;
+
+SELECT count(*)
+FROM (
+	SELECT id
+	FROM tqh_dense_policy_docs
+	ORDER BY embedding <~> hybrid_query(
+		vector_query => '[1,1,1]'::vector,
+		text_query => to_tsquery('english', 'absent'),
+		dense_k => 100,
+		bm25_k => 0,
+		final_k => 10
+	)
+	LIMIT 10
+) s;
+
+SELECT
+	(hybrid_last_scan_stats()->>'dense_effective_result_target')::int <= 150 AS latency_target_capped,
+	(hybrid_last_scan_stats()->>'dense_effective_rescore_band')::int <= 200 AS latency_rescore_capped,
+	hybrid_last_scan_stats()->>'dense_budget_policy' AS dense_budget_policy,
+	hybrid_last_scan_stats()->>'dense_rescore_band_policy' AS rescore_policy;
+
+SELECT
+	hybrid_last_scan_stats() ? 'dense_entry_us' AS has_entry_timer,
+	hybrid_last_scan_stats() ? 'dense_base_us' AS has_base_timer,
+	hybrid_last_scan_stats() ? 'dense_batch_us' AS has_batch_timer,
+	hybrid_last_scan_stats() ? 'dense_heap_us' AS has_heap_timer;
+
+SET hnsw.tq_dense_budget_policy = quality;
+SET hnsw.tq_rescore_band_policy = exact;
+
+SELECT count(*)
+FROM (
+	SELECT id
+	FROM tqh_dense_policy_docs
+	ORDER BY embedding <~> hybrid_query(
+		vector_query => '[1,1,1]'::vector,
+		text_query => to_tsquery('english', 'absent'),
+		dense_k => 100,
+		bm25_k => 0,
+		final_k => 10
+	)
+	LIMIT 10
+) s;
+
+SELECT
+	(hybrid_last_scan_stats()->>'dense_effective_result_target')::int >= 100 AS quality_preserves_target,
+	(hybrid_last_scan_stats()->>'dense_effective_rescore_band')::int >= 100 AS quality_preserves_rescore,
+	hybrid_last_scan_stats()->>'dense_budget_policy' AS dense_budget_policy,
+	hybrid_last_scan_stats()->>'dense_rescore_band_policy' AS rescore_policy;
+
+RESET hnsw.tq_dense_budget_policy;
+RESET hnsw.tq_rescore_band_policy;
+RESET enable_seqscan;
+
+DROP TABLE tqh_dense_policy_docs;
 
 CREATE TABLE tqh_ir_docs (
 	id int,

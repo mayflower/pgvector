@@ -92,6 +92,7 @@ typedef Pointer Item;
 #define HNSW_PAGE_KIND_TQ_BM25_POSTINGS	10
 #define HNSW_PAGE_KIND_TQ_BM25_BLOCKMAX	11
 #define HNSW_PAGE_KIND_TQ_BM25_DELTA	12
+#define HNSW_PAGE_KIND_TQ_BM25_IMPACT	13
 #define HNSW_PAGE_KIND_MASK				0x00ff
 #define HNSW_PAGE_GRAPH_OP_SHIFT		8
 
@@ -192,6 +193,11 @@ extern int	hnsw_tq_graph_batch_size;
 extern int	hnsw_tq_graph_avx512_weighted;
 extern int	hnsw_tq_graph_lookahead_prefetch;
 extern int	hnsw_tq_graph_lookahead_threshold_kb;
+extern int	hnsw_tq_dense_budget_policy;
+extern int	hnsw_tq_dense_max_candidate_multiplier;
+extern double hnsw_tq_dense_latency_multiplier;
+extern int	hnsw_tq_dense_max_rescore_multiplier;
+extern int	hnsw_tq_rescore_band_policy;
 extern int	hnsw_lock_tranche_id;
 
 typedef enum TqRoutingMode
@@ -209,6 +215,30 @@ typedef enum TqGraphRescoreBand
 	TQ_GRAPH_RESCORE_BAND_NONE,
 	TQ_GRAPH_RESCORE_BAND_EXACT
 }			TqGraphRescoreBand;
+
+typedef enum TqDenseBudgetPolicy
+{
+	TQ_DENSE_BUDGET_QUALITY,
+	TQ_DENSE_BUDGET_BALANCED,
+	TQ_DENSE_BUDGET_LATENCY,
+	TQ_DENSE_BUDGET_AUTO
+}			TqDenseBudgetPolicy;
+
+typedef enum TqRescoreBandPolicy
+{
+	TQ_RESCORE_BAND_POLICY_EXACT,
+	TQ_RESCORE_BAND_POLICY_LIMITED,
+	TQ_RESCORE_BAND_POLICY_AUTO,
+	TQ_RESCORE_BAND_POLICY_OFF
+}			TqRescoreBandPolicy;
+
+typedef enum TqDenseWideningReason
+{
+	TQ_DENSE_WIDENING_NONE,
+	TQ_DENSE_WIDENING_DIMENSION,
+	TQ_DENSE_WIDENING_FILTER,
+	TQ_DENSE_WIDENING_EXACT_POLICY
+}			TqDenseWideningReason;
 
 typedef enum TqGraphExactCache
 {
@@ -671,10 +701,22 @@ typedef struct HnswScanOpaqueData
 	int64		graphEntryPointCount;
 	int64		graphPrepareUs;
 	int64		graphTraverseUs;
+	int64		graphEntryUs;
+	int64		graphBaseUs;
+	int64		graphBatchUs;
+	int64		graphHeapUs;
 	int64		graphFillUs;
 	int64		graphRescoreUs;
 	int64		graphSortUs;
 	int64		graphTotalUs;
+	int64		graphDenseRequestedK;
+	int64		graphEffectiveResultTarget;
+	int64		graphEffectiveSearchEf;
+	int64		graphEffectiveRescoreBand;
+	double		graphHighdimWideningMultiplier;
+	int			graphWideningReason;
+	int			graphDenseBudgetPolicy;
+	int			graphRescoreBandPolicy;
 	int			graphStorageKind;
 	bool		turboquantGraphScan;
 	bool		turboquantFlatScan;

@@ -39,6 +39,16 @@ int			tqhybrid_last_bm25_score_kernel = TQHYBRID_BM25_KERNEL_SCALAR;
 uint64		tqhybrid_last_bm25_simd_blocks = 0;
 uint64		tqhybrid_last_bm25_scalar_tail_postings = 0;
 
+typedef struct TqHybridBm25CacheLexiconEntry TqHybridBm25CacheLexiconEntry;
+
+typedef struct TqHybridBm25ImpactEntry
+{
+	uint32		nodeId;
+	uint16		tfNormQ16;
+	uint16		reserved;
+	float4		score;
+} TqHybridBm25ImpactEntry;
+
 const char *
 TqHybridBm25KernelName(int kernel)
 {
@@ -62,6 +72,7 @@ typedef struct TqHybridBm25QueryTerm
 	bool		hasLexicon;
 	uint32		baseDf;
 	uint32		deltaDf;
+	TqHybridBm25CacheLexiconEntry *cacheEntry;
 	TqHybridBm25LexiconEntryData lexicon;
 } TqHybridBm25QueryTerm;
 
@@ -85,6 +96,11 @@ typedef struct TqHybridBm25AccumulatorEntry
 typedef struct TqHybridBm25Accumulator
 {
 	HTAB	   *entries;
+	TqHybridBm25AccumulatorEntry *denseEntries;
+	uint32	   *denseGenerations;
+	uint32		denseGeneration;
+	uint32		denseCapacity;
+	int			mode;
 	TqHybridBm25NodeScore *touched;
 	uint32		touchedCount;
 	uint32		touchedCapacity;
@@ -92,9 +108,20 @@ typedef struct TqHybridBm25Accumulator
 	uint32		topHeapCount;
 	uint32		topHeapCapacity;
 	double		threshold;
+	double		seedThreshold;
 	MemoryContext memoryContext;
 	TqHybridBm25QueryStats *stats;
 } TqHybridBm25Accumulator;
+
+typedef struct TqHybridBm25DenseAccumulatorStorage
+{
+	TqHybridBm25AccumulatorEntry *entries;
+	uint32	   *generations;
+	uint32		capacity;
+	uint32		generation;
+} TqHybridBm25DenseAccumulatorStorage;
+
+static TqHybridBm25DenseAccumulatorStorage tqhybrid_bm25_dense_accumulator;
 
 typedef struct TqHybridBm25PostingIterator
 {
@@ -114,6 +141,8 @@ typedef struct TqHybridBm25PostingIterator
 	uint16		count;
 	uint16		pos;
 	uint16		maxTf;
+	uint16		maxTfNormQ16;
+	float4		maxScoreFactor;
 	uint32		lastNodeId;
 	BlockNumber nextBlkno;
 	OffsetNumber nextOffno;
@@ -296,7 +325,7 @@ TqHybridBm25DecodePostingsTuple(TqHybridBm25PostingsTuple tuple,
 	return ptr == end;
 }
 
-typedef struct TqHybridBm25CacheLexiconEntry
+struct TqHybridBm25CacheLexiconEntry
 {
 	uint16		termLen;
 	uint64		termHash;
@@ -309,9 +338,16 @@ typedef struct TqHybridBm25CacheLexiconEntry
 	uint32		postingsBytes;
 	BlockNumber blockMaxBlkno;
 	OffsetNumber blockMaxOffno;
+	BlockNumber impactBlkno;
+	OffsetNumber impactOffno;
+	uint16		storedImpactCount;
 	uint32		termOffset;
 	char	   *termBytes;
-} TqHybridBm25CacheLexiconEntry;
+	bool		impactBuilt;
+	bool		impactEligible;
+	uint32		impactCount;
+	TqHybridBm25ImpactEntry *impactHead;
+};
 
 typedef struct TqHybridBm25DeltaCachePosting
 {
@@ -420,20 +456,69 @@ TqHybridBm25PageIsKind(Page page, uint16 pageKind)
 static void
 TqHybridBm25AccumulatorInit(TqHybridBm25Accumulator *acc,
 							MemoryContext memoryContext, uint32 initialSize,
-							uint32 topK, TqHybridBm25QueryStats *stats)
+							uint32 topK, int mode, uint32 nodeCount,
+							TqHybridBm25QueryStats *stats)
 {
 	HASHCTL		ctl;
 
 	memset(acc, 0, sizeof(*acc));
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(uint32);
-	ctl.entrysize = sizeof(TqHybridBm25AccumulatorEntry);
-	ctl.hcxt = memoryContext;
+	acc->mode = mode;
+	if (mode == TQHYBRID_BM25_ACCUMULATOR_DENSE)
+	{
+		MemoryContext oldCtx;
 
-	acc->entries = hash_create("turbohybrid BM25 query accumulator",
-							   Max(initialSize, 16),
-							   &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		oldCtx = MemoryContextSwitchTo(CacheMemoryContext);
+		if (tqhybrid_bm25_dense_accumulator.capacity < nodeCount)
+		{
+			uint32		oldCapacity = tqhybrid_bm25_dense_accumulator.capacity;
+
+			if (tqhybrid_bm25_dense_accumulator.entries == NULL)
+				tqhybrid_bm25_dense_accumulator.entries =
+					MemoryContextAlloc(CacheMemoryContext,
+									   sizeof(TqHybridBm25AccumulatorEntry) *
+									   nodeCount);
+			else
+				tqhybrid_bm25_dense_accumulator.entries =
+					repalloc(tqhybrid_bm25_dense_accumulator.entries,
+							 sizeof(TqHybridBm25AccumulatorEntry) * nodeCount);
+			if (tqhybrid_bm25_dense_accumulator.generations == NULL)
+				tqhybrid_bm25_dense_accumulator.generations =
+					MemoryContextAllocZero(CacheMemoryContext,
+										   sizeof(uint32) * nodeCount);
+			else
+			{
+				tqhybrid_bm25_dense_accumulator.generations =
+					repalloc(tqhybrid_bm25_dense_accumulator.generations,
+							 sizeof(uint32) * nodeCount);
+				memset(tqhybrid_bm25_dense_accumulator.generations + oldCapacity,
+					   0, sizeof(uint32) * (nodeCount - oldCapacity));
+			}
+			tqhybrid_bm25_dense_accumulator.capacity = nodeCount;
+		}
+		if (++tqhybrid_bm25_dense_accumulator.generation == 0)
+		{
+			memset(tqhybrid_bm25_dense_accumulator.generations, 0,
+				   sizeof(uint32) * tqhybrid_bm25_dense_accumulator.capacity);
+			tqhybrid_bm25_dense_accumulator.generation = 1;
+		}
+		MemoryContextSwitchTo(oldCtx);
+
+		acc->denseEntries = tqhybrid_bm25_dense_accumulator.entries;
+		acc->denseGenerations = tqhybrid_bm25_dense_accumulator.generations;
+		acc->denseGeneration = tqhybrid_bm25_dense_accumulator.generation;
+		acc->denseCapacity = tqhybrid_bm25_dense_accumulator.capacity;
+	}
+	else
+	{
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(uint32);
+		ctl.entrysize = sizeof(TqHybridBm25AccumulatorEntry);
+		ctl.hcxt = memoryContext;
+		acc->entries = hash_create("turbohybrid BM25 query accumulator",
+								   Max(initialSize, 16),
+								   &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
 	acc->touchedCapacity = Max(initialSize, 16);
 	acc->touched = MemoryContextAllocZero(memoryContext,
 										  sizeof(TqHybridBm25NodeScore) *
@@ -445,6 +530,8 @@ TqHybridBm25AccumulatorInit(TqHybridBm25Accumulator *acc,
 											  topK);
 	acc->memoryContext = memoryContext;
 	acc->stats = stats;
+	if (stats != NULL)
+		stats->accumulatorMode = mode;
 }
 
 static bool
@@ -566,10 +653,26 @@ TqHybridBm25AccumulatorLookup(TqHybridBm25Accumulator *acc, uint32 nodeId,
 	TqHybridBm25AccumulatorEntry *entry;
 	bool		found;
 
-	entry = hash_search(acc->entries, &nodeId,
-						create ? HASH_ENTER : HASH_FIND, &found);
-	if (entry == NULL || found || !create)
-		return entry;
+	if (acc->mode == TQHYBRID_BM25_ACCUMULATOR_DENSE)
+	{
+		if (nodeId >= acc->denseCapacity)
+			return NULL;
+		entry = &acc->denseEntries[nodeId];
+		found = acc->denseGenerations[nodeId] == acc->denseGeneration;
+		if (found || !create)
+			return found ? entry : NULL;
+
+		acc->denseGenerations[nodeId] = acc->denseGeneration;
+	}
+	else
+	{
+		if (acc->stats != NULL)
+			acc->stats->accumulatorHashLookups++;
+		entry = hash_search(acc->entries, &nodeId,
+							create ? HASH_ENTER : HASH_FIND, &found);
+		if (entry == NULL || found || !create)
+			return entry;
+	}
 
 	entry->nodeId = nodeId;
 	entry->score = 0.0;
@@ -601,8 +704,13 @@ TqHybridBm25AccumulatorAddTermScore(TqHybridBm25Accumulator *acc,
 	TqHybridBm25AccumulatorEntry *entry;
 
 	entry = TqHybridBm25AccumulatorLookup(acc, nodeId, true);
+	if (entry == NULL)
+		return;
 	entry->score += score;
 	entry->matchedTerms |= matchBit;
+	if (acc->stats != NULL &&
+		acc->mode == TQHYBRID_BM25_ACCUMULATOR_DENSE)
+		acc->stats->accumulatorDenseUpdates++;
 	TqHybridBm25AccumulatorUpdateTopK(acc, entry);
 }
 
@@ -1027,6 +1135,9 @@ TqHybridBm25LoadLexiconDirectory(Relation index,
 			entry->postingsBytes = tuple->postingsBytes;
 			entry->blockMaxBlkno = tuple->blockMaxBlkno;
 			entry->blockMaxOffno = tuple->blockMaxOffno;
+			entry->impactBlkno = tuple->impactBlkno;
+			entry->impactOffno = tuple->impactOffno;
+			entry->storedImpactCount = tuple->impactCount;
 			entry->termOffset =
 				TqHybridBm25CacheAppendTermBytes(cache, tuple->termBytes,
 												 tuple->termLen);
@@ -1193,6 +1304,10 @@ TqHybridBm25CacheFindLexiconEntry(TqHybridBm25Cache *cache,
 			entry->postingsBytes = candidate->postingsBytes;
 			entry->blockMaxBlkno = candidate->blockMaxBlkno;
 			entry->blockMaxOffno = candidate->blockMaxOffno;
+			entry->impactBlkno = candidate->impactBlkno;
+			entry->impactOffno = candidate->impactOffno;
+			entry->impactCount = candidate->storedImpactCount;
+			term->cacheEntry = candidate;
 			return true;
 		}
 		if (cmp < 0)
@@ -1514,6 +1629,19 @@ TqHybridBm25MatchedQuery(TSQuery query, TqHybridBm25QueryTerm *terms,
 									   terms, termCount, matchedTerms);
 }
 
+static bool
+TqHybridBm25QueryHasOperator(TSQuery query, int oper)
+{
+	QueryItem  *items = GETQUERY(query);
+
+	for (int i = 0; i < query->size; i++)
+	{
+		if (items[i].type == QI_OPR && items[i].qoperator.oper == oper)
+			return true;
+	}
+	return false;
+}
+
 static void
 TqHybridBm25CountDeltaDf(TqHybridBm25DeltaCacheEntry *deltaTerms,
 						 uint32 deltaTermCount,
@@ -1528,6 +1656,35 @@ TqHybridBm25CountDeltaDf(TqHybridBm25DeltaCacheEntry *deltaTerms,
 		if (entry != NULL)
 			terms[termNo].deltaDf = entry->df;
 	}
+}
+
+static int
+TqHybridBm25ChooseAccumulatorMode(const TqHybridBm25MetaTupleData *meta,
+								  TqHybridBm25QueryTerm *terms, int termCount)
+{
+	uint64		sumDf = 0;
+	uint32		maxDf = 0;
+	double		docCount = Max((double) meta->docCount +
+							   (double) meta->deltaDocCount, 1.0);
+
+	if (tqhybrid_bm25_accumulator_mode ==
+		TQHYBRID_BM25_ACCUMULATOR_HASH)
+		return TQHYBRID_BM25_ACCUMULATOR_HASH;
+	if (tqhybrid_bm25_accumulator_mode ==
+		TQHYBRID_BM25_ACCUMULATOR_DENSE)
+		return TQHYBRID_BM25_ACCUMULATOR_DENSE;
+
+	for (int termNo = 0; termNo < termCount; termNo++)
+	{
+		uint32		df = terms[termNo].baseDf + terms[termNo].deltaDf;
+
+		sumDf += df;
+		maxDf = Max(maxDf, df);
+	}
+	if (sumDf > (uint64) tqhybrid_bm25_dense_accumulator_threshold ||
+		((double) maxDf / docCount) > tqhybrid_bm25_dense_accumulator_df_ratio)
+		return TQHYBRID_BM25_ACCUMULATOR_DENSE;
+	return TQHYBRID_BM25_ACCUMULATOR_HASH;
 }
 
 static void
@@ -1567,17 +1724,22 @@ TqHybridBm25ScoreDelta(const TqHybridBm25MetaTupleData *meta,
 			TqHybridBm25AccumulatorEntry *entry;
 
 			dl = Max((double) posting->docLen, 1.0);
-			norm = (double) meta->k1 *
-				(1.0 - (double) meta->b +
-				 (double) meta->b * dl / Max(avgDocLen, 1.0));
-			entry = TqHybridBm25AccumulatorLookup(acc, posting->nodeId, true);
-			entry->docLen = posting->docLen;
-			entry->heaptid = posting->heaptid;
-			entry->hasDeltaDoc = true;
-			entry->score += idf *
-				((tf * ((double) meta->k1 + 1.0)) / (tf + norm));
-			entry->matchedTerms |= term->matchBit;
-			TqHybridBm25AccumulatorUpdateTopK(acc, entry);
+				norm = (double) meta->k1 *
+					(1.0 - (double) meta->b +
+					 (double) meta->b * dl / Max(avgDocLen, 1.0));
+				entry = TqHybridBm25AccumulatorLookup(acc, posting->nodeId, true);
+				if (entry == NULL)
+					continue;
+				entry->docLen = posting->docLen;
+				entry->heaptid = posting->heaptid;
+				entry->hasDeltaDoc = true;
+				entry->score += idf *
+					((tf * ((double) meta->k1 + 1.0)) / (tf + norm));
+				entry->matchedTerms |= term->matchBit;
+				if (stats != NULL &&
+					acc->mode == TQHYBRID_BM25_ACCUMULATOR_DENSE)
+					stats->accumulatorDenseUpdates++;
+				TqHybridBm25AccumulatorUpdateTopK(acc, entry);
 			if (stats != NULL)
 			{
 				stats->postingsDecoded++;
@@ -1664,6 +1826,165 @@ TqHybridBm25ScoreCompare(const void *a, const void *b)
 	return (sa->nodeId > sb->nodeId) - (sa->nodeId < sb->nodeId);
 }
 
+static int
+TqHybridBm25ImpactCompare(const void *a, const void *b)
+{
+	const TqHybridBm25ImpactEntry *ia = (const TqHybridBm25ImpactEntry *) a;
+	const TqHybridBm25ImpactEntry *ib = (const TqHybridBm25ImpactEntry *) b;
+
+	if (ia->score > ib->score)
+		return -1;
+	if (ia->score < ib->score)
+		return 1;
+	return (ia->nodeId > ib->nodeId) - (ia->nodeId < ib->nodeId);
+}
+
+static bool
+TqHybridBm25NodeScoreHeapLess(TqHybridBm25NodeScore a,
+							  TqHybridBm25NodeScore b)
+{
+	if (a.score < b.score)
+		return true;
+	if (a.score > b.score)
+		return false;
+	return a.nodeId > b.nodeId;
+}
+
+static void
+TqHybridBm25NodeScoreHeapSwap(TqHybridBm25NodeScore *heap, uint32 a, uint32 b)
+{
+	TqHybridBm25NodeScore tmp = heap[a];
+
+	heap[a] = heap[b];
+	heap[b] = tmp;
+}
+
+static void
+TqHybridBm25NodeScoreHeapSiftUp(TqHybridBm25NodeScore *heap, uint32 pos)
+{
+	while (pos > 0)
+	{
+		uint32		parent = (pos - 1) / 2;
+
+		if (!TqHybridBm25NodeScoreHeapLess(heap[pos], heap[parent]))
+			break;
+		TqHybridBm25NodeScoreHeapSwap(heap, pos, parent);
+		pos = parent;
+	}
+}
+
+static void
+TqHybridBm25NodeScoreHeapSiftDown(TqHybridBm25NodeScore *heap, uint32 count,
+								  uint32 pos)
+{
+	for (;;)
+	{
+		uint32		left = pos * 2 + 1;
+		uint32		right = left + 1;
+		uint32		smallest = pos;
+
+		if (left < count &&
+			TqHybridBm25NodeScoreHeapLess(heap[left], heap[smallest]))
+			smallest = left;
+		if (right < count &&
+			TqHybridBm25NodeScoreHeapLess(heap[right], heap[smallest]))
+			smallest = right;
+		if (smallest == pos)
+			break;
+		TqHybridBm25NodeScoreHeapSwap(heap, pos, smallest);
+		pos = smallest;
+	}
+}
+
+static uint32
+TqHybridBm25SelectFinalTopK(TqHybridBm25Accumulator *acc, TSQuery query,
+							TqHybridBm25QueryTerm *terms, int termCount,
+							uint32 k, MemoryContext memoryContext)
+{
+	TqHybridBm25NodeScore *heap;
+	uint32		heapCount = 0;
+	uint32		oldTouchedCount = acc->touchedCount;
+
+	if (k == 0)
+	{
+		acc->touchedCount = 0;
+		return 0;
+	}
+
+	if (tqhybrid_bm25_force_full_sort)
+	{
+		uint32		out = 0;
+
+		for (uint32 i = 0; i < oldTouchedCount; i++)
+		{
+			TqHybridBm25AccumulatorEntry *entry;
+
+			entry = TqHybridBm25AccumulatorLookup(acc, acc->touched[i].nodeId,
+												  false);
+			if (entry == NULL ||
+				!TqHybridBm25MatchedQuery(query, terms, termCount,
+										  entry->matchedTerms))
+				continue;
+			acc->touched[out] = acc->touched[i];
+			acc->touched[out].score = entry->score;
+			out++;
+		}
+		acc->touchedCount = out;
+		if (acc->touchedCount > 1)
+			qsort(acc->touched, acc->touchedCount,
+				  sizeof(TqHybridBm25NodeScore), TqHybridBm25ScoreCompare);
+		if (acc->stats != NULL)
+		{
+			acc->stats->finalSortedCount = acc->touchedCount;
+			acc->stats->fullSortAvoided = false;
+		}
+		return Min(k, acc->touchedCount);
+	}
+
+	heap = MemoryContextAlloc(memoryContext, sizeof(TqHybridBm25NodeScore) * k);
+	for (uint32 i = 0; i < oldTouchedCount; i++)
+	{
+		TqHybridBm25AccumulatorEntry *entry;
+		TqHybridBm25NodeScore candidate;
+
+		entry = TqHybridBm25AccumulatorLookup(acc, acc->touched[i].nodeId,
+											  false);
+		if (entry == NULL ||
+			!TqHybridBm25MatchedQuery(query, terms, termCount,
+									  entry->matchedTerms))
+			continue;
+
+		candidate.nodeId = entry->nodeId;
+		candidate.score = entry->score;
+		if (heapCount < k)
+		{
+			heap[heapCount] = candidate;
+			TqHybridBm25NodeScoreHeapSiftUp(heap, heapCount);
+			heapCount++;
+		}
+		else if (TqHybridBm25ScoreCompare(&candidate, &heap[0]) < 0)
+		{
+			heap[0] = candidate;
+			TqHybridBm25NodeScoreHeapSiftDown(heap, heapCount, 0);
+			if (acc->stats != NULL)
+				acc->stats->finalHeapReplacements++;
+		}
+	}
+
+	if (heapCount > 1)
+		qsort(heap, heapCount, sizeof(TqHybridBm25NodeScore),
+			  TqHybridBm25ScoreCompare);
+	for (uint32 i = 0; i < heapCount; i++)
+		acc->touched[i] = heap[i];
+	acc->touchedCount = heapCount;
+	if (acc->stats != NULL)
+	{
+		acc->stats->finalSortedCount = heapCount;
+		acc->stats->fullSortAvoided = true;
+	}
+	return heapCount;
+}
+
 static double
 TqHybridBm25PostingScore(const TqHybridBm25MetaTupleData *meta, double idf,
 						 double avgDocLen, uint16 tf, uint32 docLen)
@@ -1697,6 +2018,369 @@ TqHybridBm25PostingScoreDecoded(const TqHybridBm25MetaTupleData *meta,
 												   posting->reserved);
 	return TqHybridBm25PostingScore(meta, idf, avgDocLen, posting->tf,
 									docLen);
+}
+
+static bool
+TqHybridBm25ReloptionImpactHead(Relation index, uint32 *minDf, uint32 *headK)
+{
+	TqHybridOptions *opts = (TqHybridOptions *) index->rd_options;
+
+	if (opts != NULL)
+	{
+		*minDf = (uint32) Max(opts->bm25ImpactMinDf, 1);
+		*headK = (uint32) Max(opts->bm25ImpactHeadK, 1);
+		return opts->bm25ImpactHead;
+	}
+
+	*minDf = 1024;
+	*headK = 2048;
+	return true;
+}
+
+static bool
+TqHybridBm25EnsureImpactHead(Relation index,
+							 const TqHybridBm25MetaTupleData *meta,
+							 const HnswMetaPageData *graphMeta,
+							 TqHybridBm25Cache *cache,
+							 TqHybridBm25QueryTerm *term,
+							 const uint32 *docLens,
+							 const bool *liveNodes,
+							 TqHybridBm25QueryStats *stats)
+{
+	TqHybridBm25CacheLexiconEntry *entry = term->cacheEntry;
+	uint32		minDf;
+	uint32		headK;
+	double		corpusDocCount;
+	double		avgDocLen;
+	double		idf;
+	TqHybridBm25ImpactEntry *impact;
+	TqHybridBm25Posting *scratch = NULL;
+	uint16		scratchCapacity = 0;
+	uint32		impactCount = 0;
+	BlockNumber postingsBlkno;
+	OffsetNumber postingsOffno;
+	MemoryContext oldCtx;
+
+	if (entry == NULL || !TqHybridBm25ReloptionImpactHead(index, &minDf, &headK))
+		return false;
+	if (entry->impactBuilt)
+		return entry->impactEligible && entry->impactCount > 0;
+	if (term->baseDf < minDf || headK == 0)
+	{
+		entry->impactBuilt = true;
+		entry->impactEligible = false;
+		return false;
+	}
+	if (BlockNumberIsValid(entry->impactBlkno) &&
+		OffsetNumberIsValid(entry->impactOffno) &&
+		entry->storedImpactCount > 0)
+	{
+		uint32		readCount = Min((uint32) entry->storedImpactCount, headK);
+		uint32		loaded = 0;
+		BlockNumber blkno = entry->impactBlkno;
+		OffsetNumber offno = entry->impactOffno;
+		double		currentCorpusDocCount = Max((double) meta->docCount +
+												 (double) meta->deltaDocCount,
+												 1.0);
+		uint32		currentDf = term->baseDf + term->deltaDf;
+		double		currentIdf = log(1.0 +
+									 (currentCorpusDocCount -
+									  (double) currentDf + 0.5) /
+									 ((double) currentDf + 0.5));
+
+		oldCtx = MemoryContextSwitchTo(cache->ctx);
+		entry->impactHead = MemoryContextAlloc(cache->ctx,
+											   sizeof(TqHybridBm25ImpactEntry) *
+											   Max(readCount, 1));
+		MemoryContextSwitchTo(oldCtx);
+
+		while (loaded < readCount &&
+			   BlockNumberIsValid(blkno) &&
+			   OffsetNumberIsValid(offno))
+		{
+			Buffer		buf;
+			Page		page;
+			ItemId		iid;
+			TqHybridBm25ImpactTuple tuple;
+			uint32		chunkCount;
+			BlockNumber nextBlkno;
+			OffsetNumber nextOffno;
+
+			buf = ReadBuffer(index, blkno);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (!TqHybridBm25PageIsKind(page, HNSW_PAGE_KIND_TQ_BM25_IMPACT) ||
+				offno > PageGetMaxOffsetNumber(page))
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+
+			iid = PageGetItemId(page, offno);
+			if (!ItemIdIsUsed(iid))
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+
+			tuple = (TqHybridBm25ImpactTuple) PageGetItem(page, iid);
+			if (tuple->type != TQHYBRID_BM25_IMPACT_TUPLE_TYPE ||
+				tuple->termId != term->lexicon.termId)
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+
+			chunkCount = Min((uint32) tuple->count, readCount - loaded);
+			for (uint32 i = 0; i < chunkCount; i++)
+			{
+				entry->impactHead[loaded + i].nodeId = tuple->entries[i].nodeId;
+				entry->impactHead[loaded + i].tfNormQ16 =
+					tuple->entries[i].tfNormQ16;
+				entry->impactHead[loaded + i].reserved = 0;
+				entry->impactHead[loaded + i].score =
+					(float4) TqHybridBm25PostingPrecomputedScore(meta,
+																 currentIdf,
+																 tuple->entries[i].tfNormQ16);
+			}
+			loaded += chunkCount;
+			nextBlkno = tuple->nextBlkno;
+			nextOffno = tuple->nextOffno;
+			UnlockReleaseBuffer(buf);
+			blkno = nextBlkno;
+			offno = nextOffno;
+		}
+
+		entry->impactCount = loaded;
+		entry->impactBuilt = true;
+		entry->impactEligible = loaded > 0;
+		return entry->impactEligible;
+	}
+
+	oldCtx = MemoryContextSwitchTo(cache->ctx);
+	impact = MemoryContextAlloc(cache->ctx,
+								sizeof(TqHybridBm25ImpactEntry) *
+								Max(term->baseDf, 1));
+	scratch = MemoryContextAlloc(cache->ctx, sizeof(TqHybridBm25Posting) * 1);
+	scratchCapacity = 1;
+	MemoryContextSwitchTo(oldCtx);
+
+	corpusDocCount = Max((double) meta->docCount +
+						 (double) meta->deltaDocCount, 1.0);
+	avgDocLen = ((double) meta->totalDocLen +
+				 (double) meta->deltaTotalDocLen) / corpusDocCount;
+	idf = log(1.0 + (corpusDocCount -
+					 (double) (term->baseDf + term->deltaDf) + 0.5) /
+			  ((double) (term->baseDf + term->deltaDf) + 0.5));
+	postingsBlkno = term->lexicon.postingsBlkno;
+	postingsOffno = term->lexicon.postingsOffno;
+
+	for (uint32 chunkNo = 0;
+		 chunkNo < term->lexicon.postingsChunkCount &&
+		 BlockNumberIsValid(postingsBlkno) &&
+		 OffsetNumberIsValid(postingsOffno);
+		 chunkNo++)
+	{
+		Buffer		buf;
+		Page		page;
+		ItemId		iid;
+		TqHybridBm25PostingsTuple postings;
+		BlockNumber nextBlkno;
+		OffsetNumber nextOffno;
+
+		buf = ReadBuffer(index, postingsBlkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!TqHybridBm25PageIsKind(page, HNSW_PAGE_KIND_TQ_BM25_POSTINGS) ||
+			postingsOffno > PageGetMaxOffsetNumber(page))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid BM25 postings pointer is invalid")));
+		}
+
+		iid = PageGetItemId(page, postingsOffno);
+		if (!ItemIdIsUsed(iid))
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+
+		postings = (TqHybridBm25PostingsTuple) PageGetItem(page, iid);
+		if (postings->type != TQHYBRID_BM25_POSTINGS_TUPLE_TYPE ||
+			postings->termId != term->lexicon.termId)
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid BM25 postings tuple is invalid")));
+		}
+		nextBlkno = postings->nextBlkno;
+		nextOffno = postings->nextOffno;
+		if (scratchCapacity < postings->count)
+		{
+			oldCtx = MemoryContextSwitchTo(cache->ctx);
+			scratch = repalloc(scratch,
+							   sizeof(TqHybridBm25Posting) * postings->count);
+			scratchCapacity = postings->count;
+			MemoryContextSwitchTo(oldCtx);
+		}
+		if (!TqHybridBm25DecodePostingsTuple(postings, ItemIdGetLength(iid),
+											 scratch))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid BM25 postings payload is invalid")));
+		}
+		for (uint16 i = 0; i < postings->count; i++)
+		{
+			uint32		nodeId = scratch[i].nodeId;
+
+			if (nodeId >= graphMeta->tqNodeCount || docLens[nodeId] == 0 ||
+				!liveNodes[nodeId])
+				continue;
+			impact[impactCount].nodeId = nodeId;
+			impact[impactCount].tfNormQ16 = scratch[i].reserved;
+			impact[impactCount].reserved = 0;
+			impact[impactCount].score =
+				(float4) TqHybridBm25PostingScoreDecoded(meta, idf, avgDocLen,
+														 &scratch[i],
+														 docLens[nodeId]);
+			impactCount++;
+		}
+
+		UnlockReleaseBuffer(buf);
+		postingsBlkno = nextBlkno;
+		postingsOffno = nextOffno;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (impactCount > 1)
+		qsort(impact, impactCount, sizeof(TqHybridBm25ImpactEntry),
+			  TqHybridBm25ImpactCompare);
+	entry->impactHead = impact;
+	entry->impactCount = Min(impactCount, headK);
+	entry->impactEligible = entry->impactCount > 0;
+	entry->impactBuilt = true;
+	if (stats != NULL)
+		stats->cacheBytes = MemoryContextMemAllocated(cache->ctx, true);
+	return entry->impactEligible;
+}
+
+static bool
+TqHybridBm25ScoreImpactSingle(Relation index,
+							  const TqHybridBm25MetaTupleData *meta,
+							  const HnswMetaPageData *graphMeta,
+							  TqHybridBm25Cache *cache,
+							  TqHybridBm25QueryTerm *terms, int termCount,
+							  const uint32 *docLens, const bool *liveNodes,
+							  TqHybridBm25Accumulator *acc, int32 k,
+							  TqHybridBm25QueryStats *stats)
+{
+	TqHybridBm25CacheLexiconEntry *entry;
+	uint32		readCount;
+
+	if (termCount != 1 || !terms[0].hasLexicon || k <= 0)
+		return false;
+	if (!TqHybridBm25EnsureImpactHead(index, meta, graphMeta, cache, &terms[0],
+									  docLens, liveNodes, stats))
+		return false;
+
+	entry = terms[0].cacheEntry;
+	readCount = Min(entry->impactCount, (uint32) k);
+	if (readCount < (uint32) k)
+		return false;
+	for (uint32 i = 0; i < readCount; i++)
+		TqHybridBm25AccumulatorAddTermScore(acc, entry->impactHead[i].nodeId,
+											entry->impactHead[i].score,
+											terms[0].matchBit);
+	if (stats != NULL)
+	{
+		stats->strategy = TQHYBRID_BM25_RUNTIME_IMPACT_SINGLE;
+		stats->impactTerms = 1;
+		stats->impactPostingsRead = readCount;
+		stats->impactFullPostingsAvoided = true;
+		stats->candidatesScored = readCount;
+	}
+	return true;
+}
+
+static bool
+TqHybridBm25SeedImpactHeads(Relation index,
+							const TqHybridBm25MetaTupleData *meta,
+							const HnswMetaPageData *graphMeta,
+							TqHybridBm25Cache *cache,
+							TqHybridBm25QueryTerm *terms, int termCount,
+							const uint32 *docLens, const bool *liveNodes,
+							TqHybridBm25Accumulator *acc, int32 k,
+							TqHybridBm25QueryStats *stats)
+{
+	bool		seeded = false;
+	TqHybridBm25NodeScore *seeds;
+	uint32		seedCount = 0;
+	uint32		seedCapacity;
+
+	if (termCount <= 1 || k <= 0)
+		return false;
+	seedCapacity = (uint32) k * (uint32) termCount;
+	seeds = MemoryContextAllocZero(acc->memoryContext,
+								   sizeof(TqHybridBm25NodeScore) *
+								   Max(seedCapacity, 1));
+
+	for (int termNo = 0; termNo < termCount; termNo++)
+	{
+		TqHybridBm25CacheLexiconEntry *entry;
+		uint32		readCount;
+
+		if (!terms[termNo].hasLexicon)
+			continue;
+		if (!TqHybridBm25EnsureImpactHead(index, meta, graphMeta, cache,
+										  &terms[termNo], docLens, liveNodes,
+										  stats))
+			continue;
+
+		entry = terms[termNo].cacheEntry;
+		readCount = Min(entry->impactCount, (uint32) k);
+		if (readCount == 0)
+			continue;
+		for (uint32 i = 0; i < readCount; i++)
+		{
+			uint32		nodeId = entry->impactHead[i].nodeId;
+			bool		found = false;
+
+			for (uint32 j = 0; j < seedCount; j++)
+			{
+				if (seeds[j].nodeId == nodeId)
+				{
+					seeds[j].score += entry->impactHead[i].score;
+					found = true;
+					break;
+				}
+			}
+			if (!found && seedCount < seedCapacity)
+			{
+				seeds[seedCount].nodeId = nodeId;
+				seeds[seedCount].score = entry->impactHead[i].score;
+				seedCount++;
+			}
+		}
+		seeded = true;
+		if (stats != NULL)
+		{
+			stats->impactTerms++;
+			stats->impactPostingsRead += readCount;
+		}
+	}
+
+	if (seedCount >= (uint32) k)
+	{
+		qsort(seeds, seedCount, sizeof(TqHybridBm25NodeScore),
+			  TqHybridBm25ScoreCompare);
+		acc->seedThreshold = seeds[k - 1].score;
+	}
+	return seeded;
 }
 
 static double
@@ -1995,6 +2679,8 @@ TqHybridBm25IteratorLoadChunk(TqHybridBm25PostingIterator *it)
 	it->count = tuple->count;
 	it->lastNodeId = tuple->lastNodeId;
 	it->maxTf = tuple->maxTf;
+	it->maxTfNormQ16 = tuple->maxTfNormQ16;
+	it->maxScoreFactor = tuple->maxScoreFactor;
 	it->nextBlkno = tuple->nextBlkno;
 	it->nextOffno = tuple->nextOffno;
 	if (it->count > 0)
@@ -2022,8 +2708,14 @@ TqHybridBm25IteratorLoadChunk(TqHybridBm25PostingIterator *it)
 			if (it->maxTf == 0)
 			{
 				for (uint16 i = 0; i < it->count; i++)
-				it->maxTf = Max(it->maxTf, it->postings[i].tf);
-		}
+					it->maxTf = Max(it->maxTf, it->postings[i].tf);
+			}
+			if (it->maxTfNormQ16 == 0)
+			{
+				for (uint16 i = 0; i < it->count; i++)
+					it->maxTfNormQ16 = Max(it->maxTfNormQ16,
+										   it->postings[i].reserved);
+			}
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -2145,6 +2837,14 @@ static double
 TqHybridBm25IteratorUpperBound(const TqHybridBm25MetaTupleData *meta,
 							   const TqHybridBm25PostingIterator *it)
 {
+	if ((meta->reserved2 & TQHYBRID_BM25_META_FLAG_TFNORM_Q16) != 0 &&
+		it->maxTfNormQ16 > 0)
+	{
+		if (it->maxScoreFactor > 0)
+			return it->idf * (double) it->maxScoreFactor;
+		return TqHybridBm25PostingPrecomputedScore(meta, it->idf,
+												   it->maxTfNormQ16);
+	}
 	return TqHybridBm25BlockUpperBound(meta, it->idf, it->avgDocLen,
 									   it->maxTf);
 }
@@ -2212,9 +2912,11 @@ TqHybridBm25OrderActiveIterators(TqHybridBm25PostingIterator **active,
 static double
 TqHybridBm25KthScore(TqHybridBm25Accumulator *acc, int32 k)
 {
+	double		threshold = acc->seedThreshold;
+
 	if (k <= 0 || acc->topHeapCount < (uint32) k)
-		return 0.0;
-	return acc->threshold;
+		return threshold;
+	return Max(acc->threshold, threshold);
 }
 
 static bool
@@ -2391,8 +3093,10 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 	int			resolvedTerms = 0;
 	int			resultCount;
 	bool		usedBaseWand = false;
+	bool		seededImpactWand = false;
 	TqHybridBm25Posting *decodedScratch = NULL;
 	uint16		decodedScratchCapacity = 0;
+	int			accumulatorMode;
 	MemoryContext oldCtx;
 
 	if (stats != NULL)
@@ -2400,6 +3104,7 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 		memset(stats, 0, sizeof(*stats));
 		stats->decodeKernel = TQHYBRID_BM25_KERNEL_SCALAR;
 		stats->scoreKernel = TQHYBRID_BM25_KERNEL_SCALAR;
+		stats->strategy = TQHYBRID_BM25_RUNTIME_NONE;
 	}
 	tqhybrid_last_bm25_decode_kernel = TQHYBRID_BM25_KERNEL_SCALAR;
 	tqhybrid_last_bm25_score_kernel = TQHYBRID_BM25_KERNEL_SCALAR;
@@ -2435,9 +3140,6 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 		stats->cacheDocstatsLoaded = cache->docStatsLoaded;
 		stats->cacheLivenessLoaded = cache->livenessLoaded;
 	}
-	TqHybridBm25AccumulatorInit(&acc, memoryContext, (uint32) (k * termCount),
-								(uint32) k, stats);
-
 	for (int termNo = 0; termNo < termCount; termNo++)
 	{
 		if (TqHybridBm25CacheFindLexiconEntry(cache, &terms[termNo],
@@ -2494,8 +3196,37 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 		if (!terms[termNo].hasLexicon && terms[termNo].deltaDf > 0)
 			resolvedTerms++;
 	}
+	accumulatorMode = TqHybridBm25ChooseAccumulatorMode(&bm25Meta, terms,
+														termCount);
+	if (tqhybrid_bm25_strategy == TQHYBRID_BM25_STRATEGY_DAAT_HASH)
+		accumulatorMode = TQHYBRID_BM25_ACCUMULATOR_HASH;
+	TqHybridBm25AccumulatorInit(&acc, memoryContext, (uint32) (k * termCount),
+								(uint32) k, accumulatorMode,
+								graphMeta.tqNodeCount, stats);
 
-	if (useWand && tqhybrid_enable_wand)
+	if (tqhybrid_bm25_strategy == TQHYBRID_BM25_STRATEGY_AUTO ||
+		tqhybrid_bm25_strategy == TQHYBRID_BM25_STRATEGY_IMPACT)
+		usedBaseWand = TqHybridBm25ScoreImpactSingle(index, &bm25Meta,
+													  &graphMeta, cache,
+													  terms, termCount,
+													  docLens, liveNodes, &acc,
+													  k, stats);
+
+	if (!usedBaseWand &&
+		(tqhybrid_bm25_strategy == TQHYBRID_BM25_STRATEGY_AUTO ||
+		 tqhybrid_bm25_strategy == TQHYBRID_BM25_STRATEGY_IMPACT) &&
+		TqHybridBm25QueryHasOperator(query, OP_OR) &&
+		!TqHybridBm25QueryHasOperator(query, OP_AND))
+		seededImpactWand = TqHybridBm25SeedImpactHeads(index, &bm25Meta,
+														&graphMeta, cache,
+														terms, termCount,
+														docLens, liveNodes,
+														&acc, k, stats);
+
+	if (!usedBaseWand &&
+		useWand && tqhybrid_enable_wand &&
+		tqhybrid_bm25_strategy != TQHYBRID_BM25_STRATEGY_DAAT_SIMD &&
+		tqhybrid_bm25_strategy != TQHYBRID_BM25_STRATEGY_DAAT_HASH)
 	{
 		usedBaseWand = TqHybridBm25ScoreBaseWand(index, &bm25Meta,
 												 &graphMeta, query, terms,
@@ -2503,10 +3234,22 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 												 docLens, liveNodes, &acc, k,
 												 memoryContext, stats);
 		if (stats != NULL)
+		{
 			stats->usedWand = usedBaseWand;
+			if (usedBaseWand)
+				stats->strategy = seededImpactWand ?
+					TQHYBRID_BM25_RUNTIME_IMPACT_SEEDED_WAND :
+					TQHYBRID_BM25_RUNTIME_WAND;
+		}
 	}
 
 	if (!usedBaseWand)
+	{
+		if (stats != NULL)
+			stats->strategy =
+				tqhybrid_bm25_strategy == TQHYBRID_BM25_STRATEGY_DAAT_HASH ?
+				TQHYBRID_BM25_RUNTIME_DAAT_HASH :
+				TQHYBRID_BM25_RUNTIME_DAAT_SIMD;
 	for (int termNo = 0; termNo < termCount; termNo++)
 	{
 		float8		idf;
@@ -2645,6 +3388,7 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
+	}
 
 	TqHybridBm25ScoreDelta(&bm25Meta, deltaTerms, deltaTermCount,
 						   terms, termCount, &acc, stats);
@@ -2655,37 +3399,15 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 		return 0;
 	}
 
-	{
-		uint32		oldTouchedCount = acc.touchedCount;
-		uint32		out = 0;
+	resultCount = TqHybridBm25SelectFinalTopK(&acc, query, terms, termCount,
+											  (uint32) k, memoryContext);
 
-		for (uint32 i = 0; i < oldTouchedCount; i++)
-		{
-			TqHybridBm25AccumulatorEntry *entry;
-
-			entry = TqHybridBm25AccumulatorLookup(&acc, acc.touched[i].nodeId,
-												  false);
-			if (entry == NULL ||
-				!TqHybridBm25MatchedQuery(query, terms, termCount,
-										  entry->matchedTerms))
-				continue;
-			acc.touched[out] = acc.touched[i];
-			acc.touched[out].score = entry->score;
-			out++;
-		}
-		acc.touchedCount = out;
-	}
-
-	if (acc.touchedCount == 0)
+	if (resultCount == 0)
 	{
 		MemoryContextSwitchTo(oldCtx);
 		return 0;
 	}
 
-	qsort(acc.touched, acc.touchedCount, sizeof(TqHybridBm25NodeScore),
-		  TqHybridBm25ScoreCompare);
-
-	resultCount = Min((uint32) k, acc.touchedCount);
 	*results = MemoryContextAllocZero(memoryContext,
 									  sizeof(TqHybridBm25Result) * resultCount);
 	for (int i = 0; i < resultCount; i++)
@@ -2759,9 +3481,19 @@ tq_debug_bm25_topk(PG_FUNCTION_ARGS)
 					 "\"delta_cache_terms\":%u,"
 					 "\"delta_cache_hit\":%s,"
 					 "\"wand_iterations\":" UINT64_FORMAT ","
-					 "\"wand_threshold_updates\":" UINT64_FORMAT ","
-					 "\"wand_active_sorts\":" UINT64_FORMAT ","
-					 "\"wand_heap_replacements\":" UINT64_FORMAT ","
+						 "\"wand_threshold_updates\":" UINT64_FORMAT ","
+						 "\"wand_active_sorts\":" UINT64_FORMAT ","
+						 "\"wand_heap_replacements\":" UINT64_FORMAT ","
+						 "\"strategy\":\"%s\","
+						 "\"impact_terms\":%u,"
+						 "\"impact_postings_read\":" UINT64_FORMAT ","
+						 "\"impact_full_postings_avoided\":%s,"
+						 "\"accumulator_mode\":\"%s\","
+					 "\"accumulator_hash_lookups\":" UINT64_FORMAT ","
+					 "\"accumulator_dense_updates\":" UINT64_FORMAT ","
+					 "\"final_heap_replacements\":" UINT64_FORMAT ","
+					 "\"final_sorted_count\":%u,"
+					 "\"full_sort_avoided\":%s,"
 					 "\"used_wand\":%s,"
 					 "\"results\":[",
 					 count,
@@ -2783,9 +3515,19 @@ tq_debug_bm25_topk(PG_FUNCTION_ARGS)
 					 stats.deltaCacheTerms,
 					 stats.deltaCacheHit ? "true" : "false",
 					 stats.wandIterations,
-					 stats.wandThresholdUpdates,
-					 stats.wandActiveSorts,
-					 stats.wandHeapReplacements,
+						 stats.wandThresholdUpdates,
+						 stats.wandActiveSorts,
+						 stats.wandHeapReplacements,
+						 TqHybridBm25RuntimeStrategyName(stats.strategy),
+						 stats.impactTerms,
+						 stats.impactPostingsRead,
+						 stats.impactFullPostingsAvoided ? "true" : "false",
+						 TqHybridBm25AccumulatorModeName(stats.accumulatorMode),
+					 stats.accumulatorHashLookups,
+					 stats.accumulatorDenseUpdates,
+					 stats.finalHeapReplacements,
+					 stats.finalSortedCount,
+					 stats.fullSortAvoided ? "true" : "false",
 					 stats.usedWand ? "true" : "false");
 
 	for (int i = 0; i < count; i++)

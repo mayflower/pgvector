@@ -84,6 +84,22 @@ static const struct config_enum_entry tq_graph_lookahead_prefetch_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry tq_dense_budget_policy_options[] = {
+	{"quality", TQ_DENSE_BUDGET_QUALITY, false},
+	{"balanced", TQ_DENSE_BUDGET_BALANCED, false},
+	{"latency", TQ_DENSE_BUDGET_LATENCY, false},
+	{"auto", TQ_DENSE_BUDGET_AUTO, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry tq_rescore_band_policy_options[] = {
+	{"exact", TQ_RESCORE_BAND_POLICY_EXACT, false},
+	{"limited", TQ_RESCORE_BAND_POLICY_LIMITED, false},
+	{"auto", TQ_RESCORE_BAND_POLICY_AUTO, false},
+	{"off", TQ_RESCORE_BAND_POLICY_OFF, false},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry tq_simd_force_options[] = {
 	{"auto", TQ_SIMD_FORCE_AUTO, false},
 	{"scalar", TQ_SIMD_FORCE_SCALAR, false},
@@ -143,6 +159,11 @@ int			hnsw_tq_graph_batch_size;
 int			hnsw_tq_graph_avx512_weighted;
 int			hnsw_tq_graph_lookahead_prefetch;
 int			hnsw_tq_graph_lookahead_threshold_kb;
+int			hnsw_tq_dense_budget_policy;
+int			hnsw_tq_dense_max_candidate_multiplier;
+double		hnsw_tq_dense_latency_multiplier;
+int			hnsw_tq_dense_max_rescore_multiplier;
+int			hnsw_tq_rescore_band_policy;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
 static relopt_kind tq_relopt_kind;
@@ -560,6 +581,38 @@ HnswInit(void)
 							&hnsw_tq_graph_lookahead_threshold_kb,
 							24576, 0, INT_MAX,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("hnsw.tq_dense_budget_policy", "Control native TurboQuant dense candidate widening",
+							 "quality preserves the historical candidate widening; latency caps high-dimensional over-collection; balanced is a middle ground; auto applies latency caps to high-dimensional unfiltered scans.",
+							 &hnsw_tq_dense_budget_policy,
+							 TQ_DENSE_BUDGET_AUTO,
+							 tq_dense_budget_policy_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.tq_dense_max_candidate_multiplier", "Maximum adaptive dense candidate multiplier",
+							"Upper bound on native graph candidates relative to requested dense_k or SQL LIMIT when latency/auto budgeting is active.",
+							&hnsw_tq_dense_max_candidate_multiplier,
+							4, 1, 1000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("hnsw.tq_dense_latency_multiplier", "Latency-mode dense candidate multiplier",
+							 "Candidate multiplier used by hnsw.tq_dense_budget_policy = latency and by high-dimensional auto mode.",
+							 &hnsw_tq_dense_latency_multiplier,
+							 1.5, 1.0, 1000.0,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.tq_dense_max_rescore_multiplier", "Maximum adaptive exact-rescore multiplier",
+							"Caps exact rescore band to requested dense_k times this multiplier when hnsw.tq_rescore_band_policy limits rescoring.",
+							&hnsw_tq_dense_max_rescore_multiplier,
+							2, 1, 1000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("hnsw.tq_rescore_band_policy", "Control native TurboQuant exact-rescore band",
+							 "exact preserves historical full-band rescoring; limited caps by LIMIT and dense_k; auto limits high-dimensional unfiltered latency scans; off disables exact rescoring.",
+							 &hnsw_tq_rescore_band_policy,
+							 TQ_RESCORE_BAND_POLICY_AUTO,
+							 tq_rescore_band_policy_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 
 	TqGraphControlInit();
 

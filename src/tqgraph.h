@@ -203,12 +203,28 @@ typedef struct TqDenseCandidate
 typedef struct TqDenseCandidateStats
 {
 	uint32		denseCandidatesRequested;
+	uint32		effectiveResultTarget;
+	uint32		effectiveSearchEf;
+	uint32		effectiveRescoreBand;
+	double		highdimWideningMultiplier;
+	int			wideningReason;
+	int			denseBudgetPolicy;
+	int			rescoreBandPolicy;
 	uint64		visitedGraphNodes;
 	uint64		scoredCodes;
 	uint32		denseCandidatesReturned;
 	uint64		exactRescoreCount;
 	uint64		codePagesRead;
 	uint64		adjPagesRead;
+	uint64		prepareUs;
+	uint64		traverseUs;
+	uint64		entryUs;
+	uint64		baseUs;
+	uint64		batchUs;
+	uint64		heapUs;
+	uint64		fillUs;
+	uint64		rescoreUs;
+	uint64		sortUs;
 } TqDenseCandidateStats;
 
 typedef struct TqGraphScanNode
@@ -527,5 +543,8 @@ int			TqGraphCollectDenseCandidates(IndexScanDesc scan, int targetK,
 										  TqDenseCandidate **outCandidates,
 										  MemoryContext resultCtx,
 										  TqDenseCandidateStats *stats);
+const char *TqGraphDenseWideningReasonName(int reason);
+const char *TqGraphDenseBudgetPolicyNameExternal(int policy);
+const char *TqGraphRescoreBandPolicyNameExternal(int policy);
 
 #endif

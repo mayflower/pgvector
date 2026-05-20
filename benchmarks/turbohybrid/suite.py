@@ -258,6 +258,17 @@ def summarize_latency(samples: list[float]) -> dict[str, float]:
     }
 
 
+def summarize_latency_us(samples: list[float]) -> dict[str, float]:
+    if not samples:
+        return {"engine_p50_us": 0.0, "engine_p95_us": 0.0, "engine_p99_us": 0.0, "engine_avg_us": 0.0}
+    return {
+        "engine_p50_us": round(statistics.median(samples), 1),
+        "engine_p95_us": round(percentile(samples, 95), 1),
+        "engine_p99_us": round(percentile(samples, 99), 1),
+        "engine_avg_us": round(statistics.mean(samples), 1),
+    }
+
+
 def timed_query(database: str, sql: str) -> float:
     start = time.perf_counter()
     run_psql(database, sql)
@@ -281,6 +292,23 @@ def run_query_batch(database: str, sql: str, runs: int, concurrency: int) -> dic
         for index, sample in enumerate(samples)
     ]
     return summary
+
+
+def run_psql_script(database: str, sql: str) -> str:
+    with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as handle:
+        handle.write(sql)
+        path = handle.name
+    try:
+        proc = subprocess.run(
+            ["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", database, "-At", "-f", path],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return proc.stdout.strip()
+    finally:
+        os.unlink(path)
 
 
 def run_psql_text(database: str, sql: str) -> str:
@@ -669,6 +697,7 @@ FROM turbohybrid_suite_docs
 ORDER BY embedding <~> hybrid_query(
     vector_query => {vector},
     dense_k => {dense_k},
+    bm25_k => 0,
     final_k => {final_k}
 )
 LIMIT {final_k}
@@ -720,6 +749,371 @@ ORDER BY embedding <~> hybrid_query(
 )
 LIMIT {final_k}
 """
+
+
+PROFILE_INBACKEND_DEFAULT_SHAPES = [
+    "dense_only",
+    "bm25_rare",
+    "bm25_common",
+    "hybrid_rare",
+    "hybrid_common",
+    "hybrid_no_lexical_match",
+    "delta_heavy",
+]
+
+ENGINE_SPEED_DEFAULT_SHAPES = [
+    "dense_only",
+    "bm25_common",
+    "hybrid_common",
+    "hybrid_no_lexical_match",
+]
+
+ENGINE_SPEED_SHAPE_ALIASES = {
+    "bm25_only_rare": "bm25_rare",
+    "bm25_only_common": "bm25_common",
+    "hybrid_rrf_rare": "hybrid_rare",
+    "hybrid_rrf_common": "hybrid_common",
+    "hybrid_weighted": "hybrid_common",
+    "delta_0_percent": "hybrid_common",
+}
+
+
+def profile_inbackend_query_body(shape: str, dense_k: int, bm25_k: int, final_k: int) -> str:
+    if shape == "dense_only":
+        return f"""
+            SELECT id
+            FROM turbohybrid_suite_docs
+            ORDER BY embedding <~> hybrid_query(
+                vector_query => query_vector,
+                dense_k => {dense_k},
+                bm25_k => 0,
+                final_k => {final_k}
+            )
+            LIMIT {final_k}
+"""
+    if shape == "bm25_rare":
+        return f"""
+            SELECT id
+            FROM turbohybrid_suite_docs
+            ORDER BY embedding <~> hybrid_query(
+                text_query => to_tsquery('english', 'term1'),
+                dense_k => 0,
+                bm25_k => {bm25_k},
+                final_k => {final_k}
+            )
+            LIMIT {final_k}
+"""
+    if shape == "bm25_common":
+        return f"""
+            SELECT id
+            FROM turbohybrid_suite_docs
+            ORDER BY embedding <~> hybrid_query(
+                text_query => to_tsquery('english', 'common'),
+                dense_k => 0,
+                bm25_k => {bm25_k},
+                final_k => {final_k}
+            )
+            LIMIT {final_k}
+"""
+    if shape == "hybrid_rare":
+        text_query = "term1"
+    elif shape in {"hybrid_common", "delta_heavy"}:
+        text_query = "common"
+    elif shape == "hybrid_no_lexical_match":
+        text_query = "definitelymissingterm"
+    else:
+        raise ValueError(f"unsupported in-backend profile query shape: {shape}")
+
+    return f"""
+            SELECT id
+            FROM turbohybrid_suite_docs
+            ORDER BY embedding <~> hybrid_query(
+                vector_query => query_vector,
+                text_query => to_tsquery('english', '{text_query}'),
+                dense_k => {dense_k},
+                bm25_k => {bm25_k},
+                final_k => {final_k}
+            )
+            LIMIT {final_k}
+"""
+
+
+def profile_inbackend_shape_block(shape: str, warmup_runs: int, runs: int, dense_k: int, bm25_k: int, final_k: int) -> str:
+    query_body = profile_inbackend_query_body(shape, dense_k, bm25_k, final_k)
+    return f"""
+    shape_name := {sql_literal(shape)};
+    FOR sample_no IN 1..{warmup_runs + runs} LOOP
+        start_ts := clock_timestamp();
+        FOR result_row IN
+{query_body}
+        LOOP
+        END LOOP;
+        elapsed_us := EXTRACT(EPOCH FROM (clock_timestamp() - start_ts)) * 1000000.0;
+        IF sample_no > {warmup_runs} THEN
+            INSERT INTO turbohybrid_profile_inbackend_samples(
+                shape,
+                sample_no,
+                latency_us,
+                hybrid_stats,
+                tq_stats,
+                simd_stats
+            )
+            VALUES (
+                shape_name,
+                sample_no - {warmup_runs},
+                elapsed_us,
+                COALESCE(hybrid_last_scan_stats(), '{{}}'::jsonb),
+                COALESCE(tq_last_scan_stats(), '{{}}'::jsonb),
+                COALESCE(tq_last_simd_stats(), '{{}}'::jsonb)
+            );
+        END IF;
+    END LOOP;
+"""
+
+
+def profile_inbackend_sql(
+    *,
+    dimensions: int,
+    dense_k: int,
+    bm25_k: int,
+    final_k: int,
+    warmup_runs: int,
+    runs: int,
+    shapes: list[str],
+    settings: list[str],
+) -> str:
+    set_prefix = apply_set_prefix(settings)
+    blocks = "\n".join(
+        profile_inbackend_shape_block(shape, warmup_runs, runs, dense_k, bm25_k, final_k)
+        for shape in shapes
+    )
+    return f"""
+{set_prefix}
+SET enable_seqscan = off;
+DROP TABLE IF EXISTS turbohybrid_profile_inbackend_samples;
+CREATE TEMP TABLE turbohybrid_profile_inbackend_samples (
+    shape text NOT NULL,
+    sample_no int NOT NULL,
+    latency_us float8 NOT NULL,
+    hybrid_stats jsonb NOT NULL,
+    tq_stats jsonb NOT NULL,
+    simd_stats jsonb NOT NULL
+);
+
+DO $profile$
+DECLARE
+    query_vector turbohybrid_suite_docs.embedding%TYPE := {vector_literal(dimensions)};
+    shape_name text;
+    sample_no int;
+    result_row record;
+    start_ts timestamptz;
+    elapsed_us float8;
+BEGIN
+{blocks}
+END
+$profile$;
+
+SELECT COALESCE(
+    jsonb_agg(
+        jsonb_build_object(
+            'shape', shape,
+            'sample_no', sample_no,
+            'latency_us', latency_us,
+            'hybrid_stats', hybrid_stats,
+            'tq_stats', tq_stats,
+            'simd_stats', simd_stats
+        )
+        ORDER BY shape, sample_no
+    ),
+    '[]'::jsonb
+)::text
+FROM turbohybrid_profile_inbackend_samples;
+"""
+
+
+def average_numeric_stats(stats_values: list[dict[str, Any]]) -> dict[str, Any]:
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    strings: dict[str, str] = {}
+    string_counts: dict[str, int] = {}
+    unstable_strings: set[str] = set()
+    for stats in stats_values:
+        for key, value in stats.items():
+            if isinstance(value, bool):
+                totals[key] = totals.get(key, 0.0) + (1.0 if value else 0.0)
+                counts[key] = counts.get(key, 0) + 1
+            elif isinstance(value, (int, float)):
+                totals[key] = totals.get(key, 0.0) + float(value)
+                counts[key] = counts.get(key, 0) + 1
+            elif isinstance(value, str):
+                if key not in strings:
+                    strings[key] = value
+                elif strings[key] != value:
+                    unstable_strings.add(key)
+                string_counts[key] = string_counts.get(key, 0) + 1
+    out: dict[str, Any] = {
+        key: round(total / counts[key], 1)
+        for key, total in sorted(totals.items())
+        if counts.get(key, 0) > 0
+    }
+    for key, value in sorted(strings.items()):
+        if key not in unstable_strings and string_counts.get(key, 0) == len(stats_values):
+            out[key] = value
+    return out
+
+
+def summarize_profile_inbackend_samples(
+    samples: list[dict[str, Any]],
+    *,
+    shapes: list[str],
+    cli_by_shape: dict[str, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    by_shape: dict[str, list[dict[str, Any]]] = {shape: [] for shape in shapes}
+    for sample in samples:
+        by_shape.setdefault(str(sample.get("shape", "")), []).append(sample)
+
+    rows: list[dict[str, Any]] = []
+    for shape in shapes:
+        shape_samples = by_shape.get(shape, [])
+        latencies = [float(sample["latency_us"]) for sample in shape_samples]
+        hybrid_stats = [dict(sample.get("hybrid_stats", {})) for sample in shape_samples]
+        tq_stats = [dict(sample.get("tq_stats", {})) for sample in shape_samples]
+        simd_stats = [dict(sample.get("simd_stats", {})) for sample in shape_samples]
+        cli = cli_by_shape.get(shape)
+        row: dict[str, Any] = {
+            "query_shape": shape,
+            "timing_mode": "in_backend",
+            "sample_count": len(latencies),
+            **summarize_latency_us(latencies),
+            "cli_avg_ms": cli.get("mean_ms") if cli else None,
+            "psql_subprocess_ms": cli,
+            "hybrid_last_scan_stats_avg": average_numeric_stats(hybrid_stats),
+            "tq_last_scan_stats_avg": average_numeric_stats(tq_stats),
+            "simd_stats_avg": average_numeric_stats(simd_stats),
+        }
+        rows.append(row)
+    return rows
+
+
+def profile_cli_timings(
+    database: str,
+    *,
+    shapes: list[str],
+    dimensions: int,
+    k: int,
+    final_k: int,
+    warmup_runs: int,
+    cli_runs: int,
+    settings: list[str],
+) -> dict[str, dict[str, Any] | None]:
+    cli_by_shape: dict[str, dict[str, Any] | None] = {shape: None for shape in shapes}
+    if cli_runs <= 0:
+        return cli_by_shape
+
+    set_prefix = apply_set_prefix(settings)
+    for shape in shapes:
+        query = set_prefix + "\nSET enable_seqscan = off;\n" + simd_profile_query(
+            shape,
+            dimensions,
+            k,
+            k,
+            final_k,
+        )
+        for _ in range(warmup_runs):
+            run_psql(database, query)
+        cli_by_shape[shape] = summarize_latency([
+            timed_query(database, query)
+            for _ in range(cli_runs)
+        ])
+        cli_by_shape[shape]["runs"] = cli_runs
+    return cli_by_shape
+
+
+def run_profile_inbackend(args: argparse.Namespace) -> None:
+    shapes = parse_str_list(args.shapes) if args.shapes else list(PROFILE_INBACKEND_DEFAULT_SHAPES)
+    unknown = [shape for shape in shapes if shape not in PROFILE_INBACKEND_DEFAULT_SHAPES]
+    if unknown:
+        raise ValueError(f"unknown in-backend profile shape(s): {', '.join(unknown)}")
+
+    settings = list(args.set or [])
+    run_psql_file(args.database, synthetic_setup_sql(args.rows, args.dimensions))
+    run_psql_file(args.database, drop_method_indexes_sql())
+    build_sql, indexes = build_method_sql("turbohybrid")
+    before_build = wal_lsn(args.database)
+    build_ms = timed_sql(args.database, apply_set_prefix(settings) + "\n" + build_sql + "\nANALYZE turbohybrid_suite_docs;")
+    after_build = wal_lsn(args.database)
+
+    if args.include_delta:
+        acceptance_insert_delta(args.database, args.dimensions, args.rows, 10)
+
+    cli_by_shape = profile_cli_timings(
+        args.database,
+        shapes=shapes,
+        dimensions=args.dimensions,
+        k=args.k,
+        final_k=args.final_k,
+        warmup_runs=args.warmup_runs,
+        cli_runs=args.cli_runs,
+        settings=settings,
+    )
+
+    raw_samples = json.loads(run_psql_script(
+        args.database,
+        profile_inbackend_sql(
+            dimensions=args.dimensions,
+            dense_k=args.k,
+            bm25_k=args.k,
+            final_k=args.final_k,
+            warmup_runs=args.warmup_runs,
+            runs=args.runs,
+            shapes=shapes,
+            settings=settings,
+        ),
+    ))
+
+    try:
+        simd_capabilities = json.loads(run_psql(args.database, "LOAD 'vector'; SELECT tq_simd_capabilities()::text;"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        simd_capabilities = {}
+
+    summary = {
+        "suite": "turbohybrid_profile_inbackend",
+        "timing_mode": "in_backend",
+        "generated_at_unix": int(time.time()),
+        "commit": git_sha(),
+        "database": args.database,
+        "postgres_version": postgres_version(args.database),
+        "rows": args.rows,
+        "dimensions": args.dimensions,
+        "k": args.k,
+        "dense_k": args.k,
+        "bm25_k": args.k,
+        "final_k": args.final_k,
+        "runs": args.runs,
+        "warmup_runs": args.warmup_runs,
+        "cli_runs": args.cli_runs,
+        "set": settings,
+        "shapes": shapes,
+        "build_ms": round(build_ms, 3),
+        "build_wal_bytes": wal_diff(args.database, before_build, after_build),
+        "index_bytes": relation_bytes(args.database, indexes),
+        "simd_capabilities": simd_capabilities,
+        "results": summarize_profile_inbackend_samples(
+            raw_samples,
+            shapes=shapes,
+            cli_by_shape=cli_by_shape,
+        ),
+    }
+
+    output = json.dumps(summary, indent=2, sort_keys=True)
+    output_path = args.output
+    if not output_path and args.output_dir:
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        output_path = str(Path(args.output_dir) / f"profile_inbackend_{args.rows}_{args.dimensions}_{git_sha(short=True)}_{timestamp}.json")
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(output + "\n", encoding="utf-8")
+    print(output)
 
 
 def apply_set_prefix(settings: list[str]) -> str:
@@ -2233,11 +2627,12 @@ def plan(_: argparse.Namespace) -> None:
     print(json.dumps({"benchmark_matrix": matrix}, indent=2, sort_keys=True))
 
 
-def git_sha() -> str:
+def git_sha(short: bool = False) -> str:
+    rev_parse = ["git", "rev-parse", "HEAD"]
+    if short:
+        rev_parse = ["git", "rev-parse", "--short", "HEAD"]
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
+        return subprocess.check_output(rev_parse, text=True, stderr=subprocess.DEVNULL).strip()
     except subprocess.CalledProcessError:
         return "unknown"
 
@@ -2687,8 +3082,8 @@ def write_acceptance_markdown(summary: dict[str, Any], path: Path) -> None:
     lines.extend([
         "## Scan Stats",
         "",
-        "| Shape | Elapsed us | Dense us | BM25 us | Fusion us | Strategy | Union | Final | Postings decoded | Blocks visited | Blocks skipped | Cache bytes |",
-        "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+        "| Shape | Elapsed us | Dense us | BM25 us | Fusion us | Fusion strategy | BM25 strategy | Union | Final | Postings decoded | Blocks visited | Blocks skipped | Cache bytes |",
+        "|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|",
     ])
     for row in summary["results"]:
         if row["method"] != "turbohybrid" or row["concurrency"] != 1:
@@ -2699,10 +3094,55 @@ def write_acceptance_markdown(summary: dict[str, Any], path: Path) -> None:
         lines.append(
             f"| {row['shape']} | {stats.get('elapsed_us', '')} | {stats.get('dense_elapsed_us', '')} | "
             f"{stats.get('bm25_elapsed_us', '')} | {stats.get('fusion_elapsed_us', '')} | "
-            f"{stats.get('fusion_strategy', '')} | {stats.get('union_candidates', '')} | "
+            f"{stats.get('fusion_strategy', '')} | {stats.get('bm25_strategy', '')} | "
+            f"{stats.get('union_candidates', '')} | "
             f"{stats.get('final_results', '')} | {stats.get('bm25_postings_decoded', '')} | "
             f"{stats.get('bm25_blocks_visited', '')} | {stats.get('bm25_blocks_skipped', '')} | "
             f"{stats.get('bm25_cache_bytes', '')} |"
+        )
+    lines.extend([
+        "",
+        "## BM25 Diagnostics",
+        "",
+        "| Shape | Strategy | Impact terms | Impact reads | Avoided full postings | Accumulator | Dense updates | Hash lookups | Final sorted | Full sort avoided |",
+        "|---|---|---:|---:|---|---|---:|---:|---:|---|",
+    ])
+    for row in summary["results"]:
+        if row["method"] != "turbohybrid" or row["concurrency"] != 1:
+            continue
+        stats = row.get("scan_stats", {}).get("hybrid_last_scan_stats", {})
+        if not stats:
+            continue
+        lines.append(
+            f"| {row['shape']} | {stats.get('bm25_strategy', '')} | "
+            f"{stats.get('bm25_impact_terms', '')} | {stats.get('bm25_impact_postings_read', '')} | "
+            f"{stats.get('bm25_impact_full_postings_avoided', '')} | "
+            f"{stats.get('bm25_accumulator_mode', '')} | {stats.get('bm25_accumulator_dense_updates', '')} | "
+            f"{stats.get('bm25_accumulator_hash_lookups', '')} | {stats.get('bm25_final_sorted_count', '')} | "
+            f"{stats.get('bm25_full_sort_avoided', '')} |"
+        )
+    lines.extend([
+        "",
+        "## Dense Policy",
+        "",
+        "| Shape | Policy | Rescore policy | Target | EF | Rescore band | Prepare us | Traverse us | Entry us | Base us | Batch us | Heap us | Fill us | Rescore us | Sort us |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in summary["results"]:
+        if row["method"] != "turbohybrid" or row["concurrency"] != 1:
+            continue
+        stats = row.get("scan_stats", {}).get("hybrid_last_scan_stats", {})
+        if not stats:
+            continue
+        lines.append(
+            f"| {row['shape']} | {stats.get('dense_budget_policy', '')} | "
+            f"{stats.get('dense_rescore_band_policy', '')} | "
+            f"{stats.get('dense_effective_result_target', '')} | {stats.get('dense_effective_search_ef', '')} | "
+            f"{stats.get('dense_effective_rescore_band', '')} | {stats.get('dense_prepare_us', '')} | "
+            f"{stats.get('dense_traverse_us', '')} | {stats.get('dense_entry_us', '')} | "
+            f"{stats.get('dense_base_us', '')} | {stats.get('dense_batch_us', '')} | "
+            f"{stats.get('dense_heap_us', '')} | {stats.get('dense_fill_us', '')} | "
+            f"{stats.get('dense_rescore_us', '')} | {stats.get('dense_sort_us', '')} |"
         )
     lines.extend([
         "",
@@ -2849,8 +3289,13 @@ def run_acceptance_one(args: argparse.Namespace, rows: int, output_suffix: str =
     summary["checks"] = acceptance_evaluate(summary)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    json_path = output_dir / f"{timestamp}{output_suffix}_summary.json"
-    md_path = output_dir / f"{timestamp}{output_suffix}_summary.md"
+    output_prefix = getattr(args, "output_prefix", "")
+    if output_prefix:
+        base_name = f"{output_prefix}_{git_sha(short=True)}_{timestamp}{output_suffix}"
+    else:
+        base_name = f"{timestamp}{output_suffix}_summary"
+    json_path = output_dir / f"{base_name}.json"
+    md_path = output_dir / f"{base_name}.md"
     json_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_acceptance_markdown(summary, md_path)
     return {"json": str(json_path), "markdown": str(md_path), "checks": summary["checks"], "rows": rows}
@@ -2865,6 +3310,434 @@ def run_acceptance(args: argparse.Namespace) -> None:
         outputs.append(run_acceptance_one(args, rows, suffix))
 
     print(json.dumps(outputs[0] if len(outputs) == 1 else {"runs": outputs}, indent=2))
+
+
+def engine_speed_rows(args: argparse.Namespace) -> list[int]:
+    if args.rows_list:
+        rows_values = parse_int_list(args.rows_list)
+    elif args.rows is not None:
+        rows_values = [args.rows]
+    else:
+        rows_values = [10000, 100000]
+    if args.large:
+        rows_values = [max(rows, 1_000_000) for rows in rows_values]
+    return rows_values
+
+
+def engine_speed_shapes(args: argparse.Namespace) -> list[str]:
+    requested = parse_str_list(args.shapes) if args.shapes else list(ENGINE_SPEED_DEFAULT_SHAPES)
+    shapes: list[str] = []
+    for shape in requested:
+        mapped = ENGINE_SPEED_SHAPE_ALIASES.get(shape, shape)
+        if mapped not in PROFILE_INBACKEND_DEFAULT_SHAPES:
+            raise ValueError(f"unknown engine-speed shape: {shape}")
+        if mapped not in shapes:
+            shapes.append(mapped)
+    return shapes
+
+
+def engine_speed_dimensions(args: argparse.Namespace) -> int:
+    return args.dimensions if args.dimensions is not None else 1536
+
+
+def engine_speed_runs(args: argparse.Namespace) -> int:
+    if args.runs is not None:
+        return args.runs
+    if args.profile == "full":
+        return 30
+    return 100
+
+
+def engine_speed_warmup(args: argparse.Namespace) -> int:
+    if args.warmup is not None:
+        return args.warmup
+    if args.profile == "smoke":
+        return 1
+    return 10
+
+
+def run_engine_speed_one(
+    args: argparse.Namespace,
+    *,
+    rows: int,
+    dimensions: int,
+    shapes: list[str],
+    runs: int,
+    warmup_runs: int,
+    settings: list[str],
+) -> dict[str, Any]:
+    run_psql_file(args.database, synthetic_setup_sql(rows, dimensions))
+    run_psql_file(args.database, drop_method_indexes_sql())
+    build_sql, indexes = build_method_sql("turbohybrid")
+    before_build = wal_lsn(args.database)
+    build_ms = timed_sql(args.database, apply_set_prefix(settings) + "\n" + build_sql + "\nANALYZE turbohybrid_suite_docs;")
+    after_build = wal_lsn(args.database)
+
+    cli_by_shape = profile_cli_timings(
+        args.database,
+        shapes=shapes,
+        dimensions=dimensions,
+        k=args.k,
+        final_k=args.final_k,
+        warmup_runs=warmup_runs,
+        cli_runs=args.cli_runs,
+        settings=settings,
+    )
+
+    raw_samples = json.loads(run_psql_script(
+        args.database,
+        profile_inbackend_sql(
+            dimensions=dimensions,
+            dense_k=args.k,
+            bm25_k=args.k,
+            final_k=args.final_k,
+            warmup_runs=warmup_runs,
+            runs=runs,
+            shapes=shapes,
+            settings=settings,
+        ),
+    ))
+
+    return {
+        "rows": rows,
+        "dimensions": dimensions,
+        "k": args.k,
+        "dense_k": args.k,
+        "bm25_k": args.k,
+        "final_k": args.final_k,
+        "runs": runs,
+        "warmup_runs": warmup_runs,
+        "build": {
+            "method": "turbohybrid",
+            "build_ms": round(build_ms, 3),
+            "build_wal_bytes": wal_diff(args.database, before_build, after_build),
+            "index_bytes": relation_bytes(args.database, indexes),
+        },
+        "results": summarize_profile_inbackend_samples(
+            raw_samples,
+            shapes=shapes,
+            cli_by_shape=cli_by_shape,
+        ),
+    }
+
+
+def parse_id_csv(value: str) -> list[int]:
+    if not value:
+        return []
+    return [int(part) for part in value.split(",") if part]
+
+
+def engine_speed_id_list_sql(query_sql: str) -> str:
+    return f"""
+WITH ranked AS MATERIALIZED (
+    SELECT id, row_number() OVER () AS ord
+    FROM (
+{query_sql}
+    ) s
+)
+SELECT COALESCE(string_agg(id::text, ',' ORDER BY ord), '')
+FROM ranked;
+"""
+
+
+def engine_speed_dense_policy_matrix(
+    database: str,
+    *,
+    dimensions: int,
+    dense_k: int,
+    final_k: int,
+    runs: int,
+    warmup_runs: int,
+    settings: list[str],
+) -> list[dict[str, Any]]:
+    recall_k = min(final_k, 100)
+    if recall_k <= 0:
+        return []
+
+    vector = vector_literal(dimensions)
+    exact_query = f"""
+        SELECT id
+        FROM turbohybrid_suite_docs
+        ORDER BY embedding <=> {vector}
+        LIMIT {recall_k}
+"""
+    exact_ids = parse_id_csv(run_psql(
+        database,
+        "SET enable_indexscan = off; SET enable_bitmapscan = off; SET enable_seqscan = on;\n"
+        + engine_speed_id_list_sql(exact_query),
+    ))
+    exact_set = set(exact_ids)
+
+    rows: list[dict[str, Any]] = []
+    for policy in ("quality", "balanced", "latency"):
+        policy_settings = list(settings) + [f"hnsw.tq_dense_budget_policy = {policy}"]
+        raw_samples = json.loads(run_psql_script(
+            database,
+            profile_inbackend_sql(
+                dimensions=dimensions,
+                dense_k=dense_k,
+                bm25_k=0,
+                final_k=final_k,
+                warmup_runs=warmup_runs,
+                runs=runs,
+                shapes=["dense_only"],
+                settings=policy_settings,
+            ),
+        ))
+        timing = summarize_profile_inbackend_samples(
+            raw_samples,
+            shapes=["dense_only"],
+            cli_by_shape={"dense_only": None},
+        )[0]
+        candidate_query = f"""
+        SELECT id
+        FROM turbohybrid_suite_docs
+        ORDER BY embedding <~> hybrid_query(
+            vector_query => {vector},
+            dense_k => {dense_k},
+            bm25_k => 0,
+            final_k => {final_k}
+        )
+        LIMIT {recall_k}
+"""
+        candidate_ids = parse_id_csv(run_psql(
+            database,
+            apply_set_prefix(policy_settings)
+            + "\nSET enable_seqscan = off;\n"
+            + engine_speed_id_list_sql(candidate_query),
+        ))
+        overlap = len(exact_set.intersection(candidate_ids))
+        recall = round(overlap / recall_k, 4) if recall_k else 0.0
+        rows.append({
+            "shape": "dense_only",
+            "policy": policy,
+            "dense_k": dense_k,
+            "recall_k": recall_k,
+            "recall_at_100": recall,
+            "overlap": overlap,
+            "engine_avg_us": timing.get("engine_avg_us", 0.0),
+            "engine_p95_us": timing.get("engine_p95_us", 0.0),
+            "hybrid_last_scan_stats_avg": timing.get("hybrid_last_scan_stats_avg", {}),
+            "tq_last_scan_stats_avg": timing.get("tq_last_scan_stats_avg", {}),
+        })
+
+    return rows
+
+
+def engine_speed_stats(row: dict[str, Any]) -> dict[str, Any]:
+    stats = dict(row.get("hybrid_last_scan_stats_avg", {}) or {})
+    if row.get("query_shape", row.get("shape")) != "dense_only":
+        return stats
+
+    tq_stats = row.get("tq_last_scan_stats_avg", {}) or {}
+    fallback_keys = {
+        "dense_prepare_us": "graph_prepare_us",
+        "dense_traverse_us": "graph_traverse_us",
+        "dense_entry_us": "graph_entry_us",
+        "dense_base_us": "graph_base_us",
+        "dense_batch_us": "graph_batch_us",
+        "dense_heap_us": "graph_heap_us",
+        "dense_rescore_us": "graph_rescore_us",
+        "dense_effective_result_target": "graph_effective_result_target",
+        "dense_effective_rescore_band": "graph_effective_rescore_band",
+        "dense_effective_search_ef": "graph_effective_search_ef",
+        "dense_highdim_widening_multiplier": "graph_highdim_widening_multiplier",
+        "graph_exact_rescore_count": "graph_rescore_count",
+        "graph_scored_codes": "graph_scored_codes",
+        "graph_visited_nodes": "graph_visited_nodes",
+    }
+    for dest, source in fallback_keys.items():
+        if stats.get(dest, 0) in (0, 0.0, "", None) and source in tq_stats:
+            stats[dest] = tq_stats[source]
+    return stats
+
+
+def write_engine_speed_markdown(summary: dict[str, Any], path: Path) -> None:
+    lines = [
+        "# TurboHybrid Engine-Speed Benchmark",
+        "",
+        f"- Commit: `{summary['commit']}`",
+        f"- PostgreSQL: `{summary['postgres_version']}`",
+        f"- Host: `{summary['host']}`",
+        f"- Timing mode: `{summary['timing_mode']}`",
+        f"- Rows: {', '.join(str(row) for row in summary['rows_list'])}",
+        f"- Dimensions: {summary['dimensions']}",
+        f"- k: {summary['k']}",
+        f"- final_k: {summary['final_k']}",
+        f"- Runs: {summary['runs']}",
+        f"- Warmup runs: {summary['warmup_runs']}",
+        f"- CLI subprocess runs: {summary['cli_runs']}",
+        f"- Generated at Unix time: {summary['generated_at_unix']}",
+        "",
+    ]
+
+    for run in summary["runs_by_rows"]:
+        lines.extend([
+            f"## {run['rows']} Rows / {run['dimensions']} Dimensions / k={run['k']} In-Backend",
+            "",
+            "| Shape | Avg us | p50 us | p95 us | p99 us | Graph prep us | Graph traverse us | Entry us | Base us | Batch us | Heap us | Rescore us | BM25 us | Fusion us |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in run["results"]:
+            stats = engine_speed_stats(row)
+            lines.append(
+                f"| {row['query_shape']} | {row.get('engine_avg_us', '')} | "
+                f"{row.get('engine_p50_us', '')} | {row.get('engine_p95_us', '')} | "
+                f"{row.get('engine_p99_us', '')} | {stats.get('dense_prepare_us', '')} | "
+                f"{stats.get('dense_traverse_us', '')} | {stats.get('dense_entry_us', '')} | "
+                f"{stats.get('dense_base_us', '')} | {stats.get('dense_batch_us', '')} | "
+                f"{stats.get('dense_heap_us', '')} | {stats.get('dense_rescore_us', '')} | "
+                f"{stats.get('bm25_elapsed_us', '')} | {stats.get('fusion_elapsed_us', '')} |"
+            )
+        lines.extend([
+            "",
+            "### Build And Storage",
+            "",
+            "| Build ms | Build WAL bytes | Index bytes |",
+            "|---:|---:|---:|",
+            f"| {run['build']['build_ms']} | {run['build']['build_wal_bytes']} | {run['build']['index_bytes']} |",
+            "",
+        ])
+
+    common_rows = [
+        (run, row)
+        for run in summary["runs_by_rows"]
+        for row in run["results"]
+        if row["query_shape"] == "bm25_common"
+    ]
+    preferred_common = [item for item in common_rows if item[0]["rows"] == 100000]
+    diagnostics_rows = preferred_common or common_rows
+    lines.extend([
+        "## BM25 Diagnostics",
+        "",
+        "| Rows | Shape | Strategy | Postings decoded | Blocks visited | Blocks skipped | Accumulator | Final sorted | Impact reads | Avg us |",
+        "|---:|---|---|---:|---:|---:|---|---:|---:|---:|",
+    ])
+    for run, row in diagnostics_rows:
+        stats = row.get("hybrid_last_scan_stats_avg", {})
+        lines.append(
+            f"| {run['rows']} | {row['query_shape']} | {stats.get('bm25_strategy', '')} | "
+            f"{stats.get('bm25_postings_decoded', '')} | {stats.get('bm25_blocks_visited', '')} | "
+            f"{stats.get('bm25_blocks_skipped', '')} | {stats.get('bm25_accumulator_mode', '')} | "
+            f"{stats.get('bm25_final_sorted_count', '')} | {stats.get('bm25_impact_postings_read', '')} | "
+            f"{row.get('engine_avg_us', '')} |"
+        )
+
+    lines.extend([
+        "",
+        "## Dense Policy",
+        "",
+        "| Rows | Shape | Policy | Dense k | Effective candidates | Exact rescore | Recall@100 | Avg us |",
+        "|---:|---|---|---:|---:|---:|---:|---:|",
+    ])
+    for run in summary["runs_by_rows"]:
+        for row in run.get("dense_policy_matrix", []):
+            stats = engine_speed_stats(row)
+            lines.append(
+                f"| {run['rows']} | {row['shape']} | {row.get('policy', '')} | "
+                f"{row.get('dense_k', '')} | {stats.get('dense_effective_result_target', '')} | "
+                f"{stats.get('dense_effective_rescore_band', '')} | "
+                f"{row.get('recall_at_100', '')} | {row.get('engine_avg_us', '')} |"
+            )
+
+    lines.extend([
+        "",
+        "## Psql Subprocess Timing",
+        "",
+        "| Rows | Shape | CLI mean ms | CLI p95 ms | Runs |",
+        "|---:|---|---:|---:|---:|",
+    ])
+    for run in summary["runs_by_rows"]:
+        for row in run["results"]:
+            cli = row.get("psql_subprocess_ms") or {}
+            lines.append(
+                f"| {run['rows']} | {row['query_shape']} | {cli.get('mean_ms', '')} | "
+                f"{cli.get('p95_ms', '')} | {cli.get('runs', 0)} |"
+            )
+
+    lines.extend([
+        "",
+        "## GUCs",
+        "",
+        "| Setting | Value |",
+        "|---|---|",
+    ])
+    for name, value in summary.get("gucs", {}).items():
+        lines.append(f"| `{name}` | `{value}` |")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_engine_speed(args: argparse.Namespace) -> None:
+    rows_values = engine_speed_rows(args)
+    shapes = engine_speed_shapes(args)
+    dimensions = engine_speed_dimensions(args)
+    runs = engine_speed_runs(args)
+    warmup_runs = engine_speed_warmup(args)
+    settings = list(args.set or [])
+
+    try:
+        simd_capabilities = json.loads(run_psql(args.database, "LOAD 'vector'; SELECT tq_simd_capabilities()::text;"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        simd_capabilities = {}
+
+    runs_by_rows = []
+    for rows in rows_values:
+        run = run_engine_speed_one(
+            args,
+            rows=rows,
+            dimensions=dimensions,
+            shapes=shapes,
+            runs=runs,
+            warmup_runs=warmup_runs,
+            settings=settings,
+        )
+        run["dense_policy_matrix"] = engine_speed_dense_policy_matrix(
+            args.database,
+            dimensions=dimensions,
+            dense_k=args.k,
+            final_k=args.final_k,
+            runs=runs,
+            warmup_runs=warmup_runs,
+            settings=settings,
+        )
+        runs_by_rows.append(run)
+
+    summary = {
+        "suite": "turbohybrid_engine_speed",
+        "timing_mode": "in_backend",
+        "generated_at_unix": int(time.time()),
+        "commit": git_sha(),
+        "database": args.database,
+        "postgres_version": postgres_version(args.database),
+        "host": f"{platform.platform()} / {platform.processor()}",
+        "host_memory_bytes": host_memory(),
+        "profile": args.profile,
+        "rows_list": rows_values,
+        "dimensions": dimensions,
+        "k": args.k,
+        "dense_k": args.k,
+        "bm25_k": args.k,
+        "final_k": args.final_k,
+        "runs": runs,
+        "warmup_runs": warmup_runs,
+        "cli_runs": args.cli_runs,
+        "shapes": shapes,
+        "set": settings,
+        "gucs": acceptance_gucs(args.database),
+        "simd_capabilities": simd_capabilities,
+        "runs_by_rows": runs_by_rows,
+    }
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    base_name = f"engine_speed_{git_sha(short=True)}_{timestamp}"
+    json_path = output_dir / f"{base_name}.json"
+    md_path = output_dir / f"{base_name}.md"
+    json_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_engine_speed_markdown(summary, md_path)
+    print(json.dumps({"json": str(json_path), "markdown": str(md_path), "rows": rows_values}, indent=2))
 
 
 def main() -> None:
@@ -2933,6 +3806,37 @@ def main() -> None:
     simd_profile_parser.add_argument("--set", action="append", default=[],
                                      help="Session GUC assignment, for example hnsw.tq_simd_force=scalar")
     simd_profile_parser.set_defaults(func=run_simd_profile)
+
+    profile_inbackend_parser = sub.add_parser(
+        "profile-inbackend",
+        help="Run TurboHybrid query timing inside one backend session",
+    )
+    profile_inbackend_parser.add_argument("--database", default="contrib_regression")
+    profile_inbackend_parser.add_argument("--rows", type=int, default=100000)
+    profile_inbackend_parser.add_argument("--dimensions", type=int, default=1536)
+    profile_inbackend_parser.add_argument("--k", type=int, default=100,
+                                          help="Dense and BM25 candidate budget")
+    profile_inbackend_parser.add_argument("--final-k", type=int, default=10)
+    profile_inbackend_parser.add_argument("--runs", type=int, default=1000)
+    profile_inbackend_parser.add_argument("--warmup-runs", type=int, default=10)
+    profile_inbackend_parser.add_argument(
+        "--shapes",
+        default="",
+        help="Comma-separated shapes; defaults to the full in-backend profile set",
+    )
+    profile_inbackend_parser.add_argument("--output-dir", default="benchmarks/turbohybrid/results")
+    profile_inbackend_parser.add_argument("--output", default="")
+    profile_inbackend_parser.add_argument(
+        "--cli-runs",
+        type=int,
+        default=0,
+        help="Optional legacy psql subprocess samples per shape, reported separately",
+    )
+    profile_inbackend_parser.add_argument("--include-delta", action="store_true",
+                                          help="Insert a 10 percent delta segment before profiling")
+    profile_inbackend_parser.add_argument("--set", action="append", default=[],
+                                          help="Session GUC assignment, for example hnsw.tq_simd_force=scalar")
+    profile_inbackend_parser.set_defaults(func=run_profile_inbackend)
 
     bm25_decode_parser = sub.add_parser("bench-bm25-decode", help="Run a focused BM25 postings decode benchmark")
     bm25_decode_parser.add_argument("--database", default="contrib_regression")
@@ -3036,6 +3940,30 @@ def main() -> None:
     acceptance_parser.add_argument("--output-dir", default="benchmarks/turbohybrid/results")
     acceptance_parser.add_argument("--thresholds", default="", help="JSON file overriding acceptance thresholds")
     acceptance_parser.set_defaults(func=run_acceptance)
+
+    engine_speed_parser = sub.add_parser("engine-speed", help="Run the engine-speed benchmark report")
+    engine_speed_parser.add_argument("--database", default="contrib_regression")
+    engine_speed_parser.add_argument("--profile", choices=sorted(ACCEPTANCE_PROFILES), default="dev")
+    engine_speed_parser.add_argument("--rows", type=int, default=None)
+    engine_speed_parser.add_argument("--rows-list", default="10000,100000")
+    engine_speed_parser.add_argument("--dimensions", type=int, default=None)
+    engine_speed_parser.add_argument("--k", type=int, default=100,
+                                     help="Dense and BM25 candidate budget for engine timing")
+    engine_speed_parser.add_argument("--final-k", type=int, default=100)
+    engine_speed_parser.add_argument("--large", action="store_true")
+    engine_speed_parser.add_argument("--methods", default="")
+    engine_speed_parser.add_argument("--shapes", default="")
+    engine_speed_parser.add_argument("--warmup", type=int, default=None)
+    engine_speed_parser.add_argument("--runs", type=int, default=None)
+    engine_speed_parser.add_argument("--cli-runs", type=int, default=1,
+                                     help="Optional legacy psql subprocess samples per shape")
+    engine_speed_parser.add_argument("--concurrency", default="")
+    engine_speed_parser.add_argument("--validation", choices=sorted(ACCEPTANCE_VALIDATION_LEVELS), default="")
+    engine_speed_parser.add_argument("--output-dir", default="benchmarks/turbohybrid/results")
+    engine_speed_parser.add_argument("--thresholds", default="", help="JSON file overriding acceptance thresholds")
+    engine_speed_parser.add_argument("--set", action="append", default=[],
+                                     help="Session GUC assignment, for example hybrid.bm25_strategy=wand")
+    engine_speed_parser.set_defaults(func=run_engine_speed)
 
     score_parser = sub.add_parser("score-run", help="Score a TREC run against qrels")
     score_parser.add_argument("--qrels", required=True)

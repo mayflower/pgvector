@@ -1716,6 +1716,18 @@ TqGraphAddElapsedUs(int64 *target, instr_time start)
 }
 
 static void
+TqGraphScoreNodeBatchTimed(HnswScanOpaque so, TqGraphScanStorage *storage,
+						   uint32 *nodeIds, int count, double *distances,
+						   Datum query)
+{
+	instr_time	start;
+
+	INSTR_TIME_SET_CURRENT(start);
+	TqGraphScoreNodeBatch(so, storage, nodeIds, count, distances, query);
+	TqGraphAddElapsedUs(&so->graphBatchUs, start);
+}
+
+static void
 TqGraphResetScan(HnswScanOpaque so)
 {
 	so->first = true;
@@ -1730,10 +1742,22 @@ TqGraphResetScan(HnswScanOpaque so)
 	so->graphEntryPointCount = 0;
 	so->graphPrepareUs = 0;
 	so->graphTraverseUs = 0;
+	so->graphEntryUs = 0;
+	so->graphBaseUs = 0;
+	so->graphBatchUs = 0;
+	so->graphHeapUs = 0;
 	so->graphFillUs = 0;
 	so->graphRescoreUs = 0;
 	so->graphSortUs = 0;
 	so->graphTotalUs = 0;
+	so->graphDenseRequestedK = 0;
+	so->graphEffectiveResultTarget = 0;
+	so->graphEffectiveSearchEf = 0;
+	so->graphEffectiveRescoreBand = 0;
+	so->graphHighdimWideningMultiplier = 1.0;
+	so->graphWideningReason = TQ_DENSE_WIDENING_NONE;
+	so->graphDenseBudgetPolicy = hnsw_tq_dense_budget_policy;
+	so->graphRescoreBandPolicy = hnsw_tq_rescore_band_policy;
 	so->tqGraphResults = NULL;
 	so->tqGraphResultCount = 0;
 	so->tqGraphResultIndex = 0;
@@ -1745,6 +1769,110 @@ TqGraphResetScan(HnswScanOpaque so)
 	so->estimatedFilterSelectivity = -1.0;
 	memset(&so->tq, 0, sizeof(HnswTqQuery));
 	MemoryContextReset(so->tmpCtx);
+}
+
+static bool
+TqGraphHasFilter(bool hasPayloadFilter, double estimatedSelectivity)
+{
+	return hasPayloadFilter ||
+		(estimatedSelectivity > 0 && estimatedSelectivity < 1);
+}
+
+static bool
+TqGraphUseLatencyDenseBudget(HnswMetaPageData *meta, bool hasPayloadFilter,
+							 double estimatedSelectivity)
+{
+	switch ((TqDenseBudgetPolicy) hnsw_tq_dense_budget_policy)
+	{
+		case TQ_DENSE_BUDGET_QUALITY:
+			return false;
+		case TQ_DENSE_BUDGET_LATENCY:
+		case TQ_DENSE_BUDGET_BALANCED:
+			return !TqGraphHasFilter(hasPayloadFilter, estimatedSelectivity);
+		case TQ_DENSE_BUDGET_AUTO:
+		default:
+			return meta->dimensions >= 1024 &&
+				!TqGraphHasFilter(hasPayloadFilter, estimatedSelectivity);
+	}
+}
+
+static double
+TqGraphDenseBudgetMultiplier(void)
+{
+	switch ((TqDenseBudgetPolicy) hnsw_tq_dense_budget_policy)
+	{
+		case TQ_DENSE_BUDGET_BALANCED:
+			return Max(2.0, hnsw_tq_dense_latency_multiplier);
+		case TQ_DENSE_BUDGET_LATENCY:
+		case TQ_DENSE_BUDGET_AUTO:
+			return hnsw_tq_dense_latency_multiplier;
+		case TQ_DENSE_BUDGET_QUALITY:
+		default:
+			return 0.0;
+	}
+}
+
+static const char *
+TqGraphDenseBudgetPolicyName(int policy)
+{
+	switch ((TqDenseBudgetPolicy) policy)
+	{
+		case TQ_DENSE_BUDGET_QUALITY:
+			return "quality";
+		case TQ_DENSE_BUDGET_BALANCED:
+			return "balanced";
+		case TQ_DENSE_BUDGET_LATENCY:
+			return "latency";
+		case TQ_DENSE_BUDGET_AUTO:
+		default:
+			return "auto";
+	}
+}
+
+static const char *
+TqGraphRescoreBandPolicyName(int policy)
+{
+	switch ((TqRescoreBandPolicy) policy)
+	{
+		case TQ_RESCORE_BAND_POLICY_EXACT:
+			return "exact";
+		case TQ_RESCORE_BAND_POLICY_LIMITED:
+			return "limited";
+		case TQ_RESCORE_BAND_POLICY_AUTO:
+			return "auto";
+		case TQ_RESCORE_BAND_POLICY_OFF:
+		default:
+			return "off";
+	}
+}
+
+const char *
+TqGraphDenseWideningReasonName(int reason)
+{
+	switch ((TqDenseWideningReason) reason)
+	{
+		case TQ_DENSE_WIDENING_DIMENSION:
+			return "dimension";
+		case TQ_DENSE_WIDENING_FILTER:
+			return "filter";
+		case TQ_DENSE_WIDENING_EXACT_POLICY:
+			return "exact_policy";
+		case TQ_DENSE_WIDENING_NONE:
+		default:
+			return "none";
+	}
+}
+
+const char *
+TqGraphDenseBudgetPolicyNameExternal(int policy)
+{
+	return TqGraphDenseBudgetPolicyName(policy);
+}
+
+const char *
+TqGraphRescoreBandPolicyNameExternal(int policy)
+{
+	return TqGraphRescoreBandPolicyName(policy);
 }
 
 IndexScanDesc
@@ -2140,8 +2268,8 @@ TqGraphScanGreedySearch(Relation index, HnswScanOpaque so, Datum query,
 										 &storage->nodes[batchNodeIds[i]]);
 		}
 		else
-			TqGraphScoreNodeBatch(so, storage, batchNodeIds, batchCount,
-								  batchDistances, query);
+			TqGraphScoreNodeBatchTimed(so, storage, batchNodeIds, batchCount,
+									   batchDistances, query);
 
 		for (int i = 0; i < batchCount; i++)
 		{
@@ -2237,6 +2365,7 @@ TqGraphSearchBaseLayer(Relation index, HnswScanOpaque so, Datum query,
 	for (int i = 0; i < entryCount; i++)
 	{
 		TqGraphFrontierItem entry = entries[i];
+		instr_time	heapStart;
 
 		if (entry.nodeId >= meta->tqNodeCount ||
 			(useVisitGeneration ?
@@ -2249,9 +2378,11 @@ TqGraphSearchBaseLayer(Relation index, HnswScanOpaque so, Datum query,
 		else
 			visited[entry.nodeId] = true;
 
+		INSTR_TIME_SET_CURRENT(heapStart);
 		TqGraphFrontierHeapPushGrowing(&frontier, &frontierCount, &frontierCapacity,
 									   maxFrontierCapacity, entry, true);
 		(void) TqGraphOfferNearest(nearest, searchEf, &nearestCount, entry.nodeId, entry.distance);
+		TqGraphAddElapsedUs(&so->graphHeapUs, heapStart);
 	}
 
 	while (frontierCount > 0)
@@ -2316,14 +2447,16 @@ TqGraphSearchBaseLayer(Relation index, HnswScanOpaque so, Datum query,
 				batchNodeIds[batchCount++] = neighbor;
 			}
 
-			TqGraphScoreNodeBatch(so, storage, batchNodeIds, batchCount,
-								  batchDistances, query);
+			TqGraphScoreNodeBatchTimed(so, storage, batchNodeIds, batchCount,
+									   batchDistances, query);
 			for (int i = 0; i < batchCount; i++)
 			{
 				uint32		neighbor = batchNodeIds[i];
 				double		neighborDistance = batchDistances[i];
 				bool		accepted;
+				instr_time	heapStart;
 
+				INSTR_TIME_SET_CURRENT(heapStart);
 				accepted = TqGraphOfferNearest(nearest, searchEf, &nearestCount,
 											   neighbor, neighborDistance);
 				if (accepted)
@@ -2337,6 +2470,7 @@ TqGraphSearchBaseLayer(Relation index, HnswScanOpaque so, Datum query,
 												   maxFrontierCapacity,
 												   frontierItem, true);
 				}
+				TqGraphAddElapsedUs(&so->graphHeapUs, heapStart);
 			}
 		}
 	}
@@ -2360,9 +2494,15 @@ TqGraphSearchBaseLayer(Relation index, HnswScanOpaque so, Datum query,
 		resultDistance = TqGraphResultDistance(so, query, node,
 											  nearest[i].distance,
 											  &exactScored);
-		TqGraphOfferCandidate(so, results, resultTarget, &resultCount,
-							  nodeId, &node->heaptid, resultDistance,
-							  exactScored);
+		{
+			instr_time	heapStart;
+
+			INSTR_TIME_SET_CURRENT(heapStart);
+			TqGraphOfferCandidate(so, results, resultTarget, &resultCount,
+								  nodeId, &node->heaptid, resultDistance,
+								  exactScored);
+			TqGraphAddElapsedUs(&so->graphHeapUs, heapStart);
+		}
 	}
 
 	if (visited != NULL)
@@ -2389,11 +2529,13 @@ TqGraphTraverse(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
 	double		sampledDistances[TQ_GRAPH_ENTRY_SAMPLE_COUNT];
 	int			entryCount = 0;
 	int			sampledCount = 0;
+	instr_time	phaseStart;
 
 	if (meta->tqNodeCount == 0 ||
 		!TqGraphLoadCodePage(index, so, meta, storage, entryNodeId))
 		return 0;
 
+	INSTR_TIME_SET_CURRENT(phaseStart);
 	entry.nodeId = entryNodeId;
 	entry.distance = TqGraphEntryDistance(so, query, &storage->nodes[entryNodeId]);
 
@@ -2441,8 +2583,8 @@ TqGraphTraverse(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
 			entryNodeIds[scoreCount++] = entries[i].nodeId;
 		}
 
-		TqGraphScoreNodeBatch(so, storage, entryNodeIds, scoreCount,
-							  entryDistances, query);
+		TqGraphScoreNodeBatchTimed(so, storage, entryNodeIds, scoreCount,
+								   entryDistances, query);
 		for (int i = 1; i < entryCount; i++)
 		{
 			for (int j = 0; j < scoreCount; j++)
@@ -2496,8 +2638,8 @@ TqGraphTraverse(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
 			sampledCount++;
 		}
 
-		TqGraphScoreNodeBatch(so, storage, sampledNodeIds, sampledCount,
-							  sampledDistances, query);
+		TqGraphScoreNodeBatchTimed(so, storage, sampledNodeIds, sampledCount,
+								   sampledDistances, query);
 		for (int i = 0; i < sampledCount; i++)
 		{
 			double		exactDistance;
@@ -2516,10 +2658,14 @@ TqGraphTraverse(Relation index, HnswScanOpaque so, HnswMetaPageData *meta,
 	}
 
 	so->graphEntryPointCount = entryCount;
+	TqGraphAddElapsedUs(&so->graphEntryUs, phaseStart);
 
-	return TqGraphSearchBaseLayer(index, so, query, meta, storage, entries, entryCount,
-								  results, resultTarget, searchEf,
-								  payloadSlot, payloadValue);
+	INSTR_TIME_SET_CURRENT(phaseStart);
+	entryCount = TqGraphSearchBaseLayer(index, so, query, meta, storage, entries, entryCount,
+										results, resultTarget, searchEf,
+										payloadSlot, payloadValue);
+	TqGraphAddElapsedUs(&so->graphBaseUs, phaseStart);
+	return entryCount;
 }
 
 static int
@@ -2575,14 +2721,20 @@ TqGraphFillCandidateBand(Relation index, HnswScanOpaque so,
 		batchNodeIds[batchCount++] = nodeId;
 		if (batchCount == TQ_GRAPH_MAX_NEIGHBORS)
 		{
-			TqGraphScoreNodeBatch(so, storage, batchNodeIds, batchCount,
-								  batchDistances, query);
+			TqGraphScoreNodeBatchTimed(so, storage, batchNodeIds, batchCount,
+									   batchDistances, query);
 			for (int i = 0; i < batchCount; i++)
 			{
 				node = &storage->nodes[batchNodeIds[i]];
-				TqGraphOfferCandidate(so, results, resultTarget, &count,
-									  batchNodeIds[i], &node->heaptid,
-									  batchDistances[i], false);
+				{
+					instr_time	heapStart;
+
+					INSTR_TIME_SET_CURRENT(heapStart);
+					TqGraphOfferCandidate(so, results, resultTarget, &count,
+										  batchNodeIds[i], &node->heaptid,
+										  batchDistances[i], false);
+					TqGraphAddElapsedUs(&so->graphHeapUs, heapStart);
+				}
 			}
 			batchCount = 0;
 		}
@@ -2590,15 +2742,21 @@ TqGraphFillCandidateBand(Relation index, HnswScanOpaque so,
 
 	if (batchCount > 0)
 	{
-		TqGraphScoreNodeBatch(so, storage, batchNodeIds, batchCount,
-							  batchDistances, query);
+		TqGraphScoreNodeBatchTimed(so, storage, batchNodeIds, batchCount,
+								   batchDistances, query);
 		for (int i = 0; i < batchCount; i++)
 		{
 			TqGraphScanNode *node = &storage->nodes[batchNodeIds[i]];
 
-			TqGraphOfferCandidate(so, results, resultTarget, &count,
-								  batchNodeIds[i], &node->heaptid,
-								  batchDistances[i], false);
+			{
+				instr_time	heapStart;
+
+				INSTR_TIME_SET_CURRENT(heapStart);
+				TqGraphOfferCandidate(so, results, resultTarget, &count,
+									  batchNodeIds[i], &node->heaptid,
+									  batchDistances[i], false);
+				TqGraphAddElapsedUs(&so->graphHeapUs, heapStart);
+			}
 		}
 	}
 
@@ -2660,13 +2818,41 @@ static int
 TqGraphFinalRescoreCount(HnswScanOpaque so, TqGraphResult *results, int count,
 						 int effectiveEf)
 {
+	int64		limitRows;
+	int64		denseK;
+	int64		limitCap;
+	int64		denseCap;
+	int64		cap;
+
 	(void) results;
 	(void) effectiveEf;
 
 	if (count <= 0 || so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_NONE)
 		return 0;
 
-	return count;
+	if (so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_EXACT ||
+		hnsw_tq_rescore_band_policy == TQ_RESCORE_BAND_POLICY_EXACT)
+		return count;
+
+	if (hnsw_tq_rescore_band_policy == TQ_RESCORE_BAND_POLICY_OFF)
+		return 0;
+
+	if (hnsw_tq_rescore_band_policy == TQ_RESCORE_BAND_POLICY_AUTO &&
+		(hnsw_tq_dense_budget_policy == TQ_DENSE_BUDGET_QUALITY ||
+		 (hnsw_tq_dense_budget_policy == TQ_DENSE_BUDGET_AUTO &&
+		  so->graphWideningReason != TQ_DENSE_WIDENING_DIMENSION)))
+		return count;
+
+	limitRows = so->hasTupleTargetRows ?
+		Max((int64) 1, so->tupleTargetRows) : Max((int64) 1, so->graphDenseRequestedK);
+	denseK = Max((int64) 1, so->graphDenseRequestedK);
+	limitCap = limitRows * 4;
+	denseCap = denseK * Max(hnsw_tq_dense_max_rescore_multiplier, 1);
+	cap = Max(limitCap, denseCap);
+
+	if (cap <= 0)
+		return count;
+	return (int) Min((int64) count, cap);
 }
 
 void
@@ -2780,6 +2966,9 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 	int			candidateOversampling;
 	bool		hasPayloadFilter = false;
 	bool		exactFree;
+	bool		highDimL2Widened = false;
+	bool		latencyBudgetActive = false;
+	int64		requestedBaseTarget;
 
 	INSTR_TIME_SET_CURRENT(totalStart);
 	INSTR_TIME_SET_CURRENT(phaseStart);
@@ -2816,6 +3005,9 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 	TqGraphSeedScanContext(so, activeTarget, estimatedSelectivity);
 	effectiveEf = so->hasInitialEffectiveEfSearch ?
 		so->initialEffectiveEfSearch : so->efSearch;
+	so->graphDenseRequestedK = minResultTarget;
+	so->graphDenseBudgetPolicy = hnsw_tq_dense_budget_policy;
+	so->graphRescoreBandPolicy = hnsw_tq_rescore_band_policy;
 
 	candidateOversampling = Max(so->graphOversampling, 1);
 	if (hasPayloadFilter && (TqScoreMode) so->tq.scoreMode != TQ_SCORE_L2)
@@ -2859,6 +3051,7 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 				else
 					l2Target = (int64) effectiveEf *
 						TQ_GRAPH_HIGHDIM_L2_TARGET_EF_MULT;
+				highDimL2Widened = true;
 		}
 
 		resultTarget = (int) Min((int64) INT_MAX,
@@ -2880,11 +3073,38 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 		 */
 		resultTarget = (int) Min((int64) INT_MAX,
 								 Max((int64) resultTarget, conservativeTarget));
+		so->graphWideningReason = TQ_DENSE_WIDENING_FILTER;
 	}
 
+	requestedBaseTarget = Max((int64) 1, (int64) minResultTarget);
+	if (so->hasTupleTargetRows)
+		requestedBaseTarget = Max(requestedBaseTarget,
+								  Max((int64) 1, so->tupleTargetRows));
+	latencyBudgetActive = TqGraphUseLatencyDenseBudget(&meta, hasPayloadFilter,
+													   estimatedSelectivity);
+	if (latencyBudgetActive)
+	{
+		double		multiplier = TqGraphDenseBudgetMultiplier();
+		int64		adaptiveCap =
+			(int64) ceil((double) requestedBaseTarget * multiplier);
+		int64		maxCap = requestedBaseTarget *
+			Max(hnsw_tq_dense_max_candidate_multiplier, 1);
+		int64		budgetCap = Max((int64) effectiveEf,
+								   Min(adaptiveCap, maxCap));
+
+		if (budgetCap > 0 && resultTarget > budgetCap)
+			resultTarget = (int) Min((int64) INT_MAX, budgetCap);
+	}
+	if (so->graphWideningReason == TQ_DENSE_WIDENING_NONE && highDimL2Widened)
+		so->graphWideningReason = TQ_DENSE_WIDENING_DIMENSION;
+	so->graphHighdimWideningMultiplier =
+		requestedBaseTarget > 0 ?
+		((double) resultTarget / (double) requestedBaseTarget) : 1.0;
 	resultTarget = Max(resultTarget, 1);
 	resultTarget = Min(resultTarget, (int) meta.tqNodeCount);
 	searchEf = Min(Max(effectiveEf, resultTarget), (int) meta.tqNodeCount);
+	so->graphEffectiveResultTarget = resultTarget;
+	so->graphEffectiveSearchEf = searchEf;
 	results = palloc(sizeof(TqGraphResult) * resultTarget);
 	TqGraphInitScanStorage(scan->indexRelation, &meta, &storage);
 	TqGraphAddElapsedUs(&so->graphPrepareUs, phaseStart);
@@ -2898,6 +3118,7 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 		qsort(results, count, sizeof(TqGraphResult), TqGraphResultCompare);
 		TqGraphAddElapsedUs(&so->graphSortUs, phaseStart);
 		so->graphCandidateCount = count;
+		so->graphEffectiveRescoreBand = so->graphRescoreCount;
 		so->tqGraphResults = results;
 		so->tqGraphResultCount = count;
 		so->tqGraphResultIndex = 0;
@@ -2923,7 +3144,8 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 	qsort(results, count, sizeof(TqGraphResult), TqGraphResultCompare);
 	TqGraphAddElapsedUs(&so->graphSortUs, phaseStart);
 
-	if (so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_AUTO &&
+	if (!latencyBudgetActive &&
+		so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_AUTO &&
 		(TqScoreMode) so->tq.scoreMode == TQ_SCORE_L2 &&
 		count > 0 && count < resultTarget && results[0].distance < 1.0)
 	{
@@ -2939,6 +3161,12 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 			resultTarget = wideTarget;
 				searchEf = Min(Max(effectiveEf, resultTarget),
 							   (int) meta.tqNodeCount);
+			so->graphEffectiveResultTarget = resultTarget;
+			so->graphEffectiveSearchEf = searchEf;
+			so->graphHighdimWideningMultiplier =
+				requestedBaseTarget > 0 ?
+				((double) resultTarget / (double) requestedBaseTarget) : 1.0;
+			so->graphWideningReason = TQ_DENSE_WIDENING_EXACT_POLICY;
 			results = palloc(sizeof(TqGraphResult) * resultTarget);
 			INSTR_TIME_SET_CURRENT(phaseStart);
 			count = TqGraphTraverse(scan->indexRelation, so, &meta, &storage,
@@ -2964,6 +3192,7 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 	so->graphCandidateCount = count;
 	if (exactFree)
 	{
+		so->graphEffectiveRescoreBand = 0;
 		so->tqGraphResults = results;
 		so->tqGraphResultCount = count;
 		so->tqGraphResultIndex = 0;
@@ -2972,8 +3201,9 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
 		return;
 	}
 	rescoreCount = TqGraphFinalRescoreCount(so, results, count, effectiveEf);
-	finalCount = so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_AUTO ?
-		rescoreCount : count;
+	so->graphEffectiveRescoreBand = rescoreCount;
+	finalCount = so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_AUTO &&
+		rescoreCount > 0 ? rescoreCount : count;
 	INSTR_TIME_SET_CURRENT(phaseStart);
 	TqGraphExactRescore(scan->indexRelation, so, query, &meta, storage.nodes,
 						results, rescoreCount);
@@ -3045,10 +3275,26 @@ TqGraphCollectDenseCandidates(IndexScanDesc scan, int targetK,
 		stats->visitedGraphNodes = so->graphVisitedNodes;
 		stats->scoredCodes = so->graphScoredCodes;
 		stats->denseCandidatesRequested = targetK > 0 ? targetK : limit;
+		stats->effectiveResultTarget = (uint32) Max(so->graphEffectiveResultTarget, 0);
+		stats->effectiveSearchEf = (uint32) Max(so->graphEffectiveSearchEf, 0);
+		stats->effectiveRescoreBand = (uint32) Max(so->graphEffectiveRescoreBand, 0);
+		stats->highdimWideningMultiplier = so->graphHighdimWideningMultiplier;
+		stats->wideningReason = so->graphWideningReason;
+		stats->denseBudgetPolicy = so->graphDenseBudgetPolicy;
+		stats->rescoreBandPolicy = so->graphRescoreBandPolicy;
 		stats->denseCandidatesReturned = limit;
 		stats->exactRescoreCount = so->graphRescoreCount;
 		stats->codePagesRead = so->graphCodePagesRead;
 		stats->adjPagesRead = so->graphAdjPagesRead;
+		stats->prepareUs = so->graphPrepareUs;
+		stats->traverseUs = so->graphTraverseUs;
+		stats->entryUs = so->graphEntryUs;
+		stats->baseUs = so->graphBaseUs;
+		stats->batchUs = so->graphBatchUs;
+		stats->heapUs = so->graphHeapUs;
+		stats->fillUs = so->graphFillUs;
+		stats->rescoreUs = so->graphRescoreUs;
+		stats->sortUs = so->graphSortUs;
 	}
 
 	*outCandidates = candidates;
