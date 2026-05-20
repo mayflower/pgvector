@@ -1,0 +1,94 @@
+{
+  "datasets": [
+    {
+      "name": "beir-fiqa",
+      "layer": "ir_quality",
+      "family": "BEIR/MTEB",
+      "scale": "medium",
+      "purpose": "Financial QA retrieval with qrels; keeps continuity with existing FIQA RAG measurements.",
+      "inputs": ["corpus.jsonl", "queries.jsonl", "qrels/test.tsv", "embeddings"],
+      "metrics": ["nDCG@10", "Recall@10", "Recall@100", "MRR@10", "MAP@100"]
+    },
+    {
+      "name": "beir-nfcorpus-scifact-hotpotqa",
+      "layer": "ir_quality",
+      "family": "BEIR/MTEB",
+      "scale": "small-to-medium",
+      "purpose": "Domain variety across medical, scientific, and multi-hop QA retrieval.",
+      "inputs": ["corpus.jsonl", "queries.jsonl", "qrels/test.tsv", "embeddings"],
+      "metrics": ["nDCG@10", "Recall@10", "Recall@100", "MRR@10", "MAP@100"]
+    },
+    {
+      "name": "msmarco-passage-dev-small",
+      "layer": "ir_quality",
+      "family": "MS MARCO",
+      "scale": "large",
+      "purpose": "High-volume web passage retrieval and first-stage ranker quality.",
+      "inputs": ["collection.tsv", "queries.dev.small.tsv", "qrels.dev.small.tsv", "embeddings"],
+      "metrics": ["MRR@10", "Recall@100", "nDCG@10"]
+    },
+    {
+      "name": "trec-dl-2019-2020",
+      "layer": "ir_quality",
+      "family": "TREC-DL",
+      "scale": "large",
+      "purpose": "Deep relevance labels for MS MARCO-style passage ranking.",
+      "inputs": ["msmarco collection", "topics", "qrels", "embeddings"],
+      "metrics": ["nDCG@10", "nDCG@100", "Recall@100", "MAP@100"]
+    },
+    {
+      "name": "miracl",
+      "layer": "ir_quality",
+      "family": "MIRACL",
+      "scale": "multilingual",
+      "purpose": "Multilingual lexical+dense stress test, including languages where stemming/tokenization differs from English.",
+      "inputs": ["corpus", "topics", "qrels", "embeddings per language"],
+      "metrics": ["nDCG@10", "Recall@100"]
+    },
+    {
+      "name": "lotte",
+      "layer": "ir_quality",
+      "family": "LoTTE",
+      "scale": "medium",
+      "purpose": "Long-tail entity and forum-style retrieval where lexical matching often matters.",
+      "inputs": ["corpus", "queries", "qrels", "embeddings"],
+      "metrics": ["Success@5", "Success@100", "nDCG@10", "Recall@100"]
+    },
+    {
+      "name": "bright",
+      "layer": "ir_quality",
+      "family": "BRIGHT",
+      "scale": "reasoning",
+      "purpose": "Harder retrieval problems that require robust hybrid ranking beyond keyword overlap.",
+      "inputs": ["corpus", "queries", "qrels", "embeddings"],
+      "metrics": ["nDCG@10", "Recall@10", "Recall@100"]
+    },
+    {
+      "name": "rag-small-answerable",
+      "layer": "ir_quality",
+      "family": "RAG end-to-end",
+      "scale": "small",
+      "purpose": "End-to-end retrieval plus generation smoke set with answer support checks.",
+      "inputs": ["documents.jsonl", "questions.jsonl", "gold_answers.jsonl", "embeddings"],
+      "metrics": ["context_recall@10", "answer_exact_match", "answer_f1", "groundedness"]
+    },
+    {
+      "name": "synthetic-postgres-systems",
+      "layer": "systems",
+      "family": "PostgreSQL synthetic",
+      "scale": "configurable",
+      "purpose": "Fast branch-local systems benchmark for hot/cold latency, QPS, build, storage, WAL, mutation, vacuum, and filter selectivity.",
+      "inputs": ["generated table"],
+      "metrics": ["p50_ms", "p95_ms", "p99_ms", "qps", "build_ms", "index_bytes", "wal_bytes", "vacuum_ms"]
+    },
+    {
+      "name": "stackoverflow-latency",
+      "layer": "systems",
+      "family": "Stack Overflow",
+      "scale": "large",
+      "purpose": "ParadeDB-style public latency harness: query files, stable timing windows, hot/cold runs, and pg_stat_statements.",
+      "inputs": ["posts", "query files", "embeddings"],
+      "metrics": ["cold_p95_ms", "hot_p95_ms", "p99_ms", "qps", "index_bytes", "pg_stat_statements"]
+    }
+  ]
+}

@@ -197,7 +197,8 @@ TqGraphAppendTuple(Relation index, ForkNumber forkNum, BlockNumber *startBlkno,
 		buf = ReadBufferExtended(index, forkNum, blkno, RBM_NORMAL, NULL);
 	}
 
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	if (!createdStart)
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (RelationNeedsWAL(index) && forkNum == MAIN_FORKNUM)
 	{
 		xlogState = GenericXLogStart(index);

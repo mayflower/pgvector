@@ -1,0 +1,127 @@
+SELECT hybrid_query_out(hybrid_query(
+	vector_query => '[1,0,0]'::vector,
+	text_query => websearch_to_tsquery('english', 'postgres vector search'),
+	fusion => 'rrf',
+	dense_k => 12,
+	bm25_k => 34,
+	rrf_k => 60
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=true,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=60,dense_k=12,bm25_k=34,final_k=20,require_bm25_match=false)' AS ok;
+
+SELECT hybrid_query_out(hybrid_query(
+	text_query => websearch_to_tsquery('english', 'postgres'),
+	fusion => 'weighted',
+	alpha => 0.25,
+	final_k => 10,
+	require_bm25_match => true
+))::text = 'hybrid_query(fusion=weighted,vector=false,tsquery=true,dense_weight=1,bm25_weight=1,alpha=0.25,rrf_k=60,dense_k=400,bm25_k=400,final_k=10,require_bm25_match=true)' AS ok;
+
+SELECT hybrid_query_out(hybrid_query(
+	vector_query => '[1,0,0]'::vector,
+	final_k => NULL
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=60,dense_k=400,bm25_k=400,final_k=null,require_bm25_match=false)' AS explicit_null_final_k;
+
+SET hybrid.default_dense_k = 7;
+SET hybrid.default_bm25_k = 8;
+SET hybrid.default_rrf_k = 9;
+
+SELECT hybrid_query_out(hybrid_query(
+	vector_query => '[1,0,0]'::vector,
+	rrf_k => NULL,
+	dense_k => NULL,
+	bm25_k => NULL
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=60,dense_k=400,bm25_k=400,final_k=20,require_bm25_match=false)' AS immutable_defaults;
+
+RESET hybrid.default_dense_k;
+RESET hybrid.default_bm25_k;
+RESET hybrid.default_rrf_k;
+
+CREATE TABLE hq_items (id int, val vector(3));
+INSERT INTO hq_items VALUES
+	(1, '[1,0,0]'),
+	(2, '[1,1,0]'),
+	(3, '[0,1,0]');
+
+SELECT id
+FROM hq_items
+ORDER BY val <~> hybrid_query(vector_query => '[1,0,0]'::vector)
+LIMIT 3;
+
+SELECT
+	('[2,0,0]'::vector <~-> hybrid_query(vector_query => '[1,0,0]'::vector)) = 1 AS l2_ok,
+	('[2,0,0]'::vector <~#> hybrid_query(vector_query => '[1,0,0]'::vector)) = -2 AS ip_ok,
+	('[2,0,0]'::vector <~> hybrid_query(vector_query => '[1,0,0]'::vector)) = 0 AS cosine_ok;
+
+SELECT bool_and(provolatile = 'i' AND proparallel = 's') AS hybrid_distance_functions_are_pure
+FROM pg_proc
+WHERE proname IN (
+	'hybrid_distance',
+	'hybrid_l2_distance',
+	'hybrid_negative_inner_product',
+	'hybrid_cosine_distance'
+);
+
+DO $$
+BEGIN
+	PERFORM hybrid_distance('[1,0,0]'::vector, hybrid_query(
+		text_query => websearch_to_tsquery('english', 'postgres')
+	));
+	RAISE EXCEPTION 'expected hybrid text fallback rejection';
+EXCEPTION WHEN feature_not_supported THEN
+END
+$$;
+
+DO $$
+BEGIN
+	PERFORM id
+	FROM hq_items
+	ORDER BY val <~> hybrid_query(
+		vector_query => '[1,0,0]'::vector,
+		text_query => websearch_to_tsquery('english', 'postgres')
+	)
+	LIMIT 1;
+	RAISE EXCEPTION 'expected scalar hybrid ordering fallback rejection';
+EXCEPTION WHEN feature_not_supported THEN
+END
+$$;
+
+DO $$
+BEGIN
+	PERFORM hybrid_query(vector_query => '[1]'::vector, dense_k => -1);
+	RAISE EXCEPTION 'expected dense_k validation error';
+EXCEPTION WHEN invalid_parameter_value THEN
+END
+$$;
+
+DO $$
+BEGIN
+	PERFORM hybrid_query(vector_query => '[1]'::vector, fusion => 'bogus');
+	RAISE EXCEPTION 'expected fusion validation error';
+EXCEPTION WHEN invalid_parameter_value THEN
+END
+$$;
+
+DO $$
+BEGIN
+	PERFORM hybrid_query(vector_query => '[1]'::vector, alpha => 1.5);
+	RAISE EXCEPTION 'expected alpha validation error';
+EXCEPTION WHEN invalid_parameter_value THEN
+END
+$$;
+
+DO $$
+BEGIN
+	PERFORM hybrid_query(vector_query => '[1]'::vector, rrf_k => 0);
+	RAISE EXCEPTION 'expected rrf_k validation error';
+EXCEPTION WHEN invalid_parameter_value THEN
+END
+$$;
+
+DO $$
+BEGIN
+	PERFORM 'anything'::hybrid_query;
+	RAISE EXCEPTION 'expected hybrid_query input rejection';
+EXCEPTION WHEN feature_not_supported THEN
+END
+$$;
+
+DROP TABLE hq_items;

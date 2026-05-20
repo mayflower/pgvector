@@ -1,0 +1,7 @@
+{
+  "hybrid_rrf_common_vs_dense_p95_ratio": 2.5,
+  "bm25_only_rare_p95_ms": 20.0,
+  "fusion_elapsed_pct_final_k_50": 20.0,
+  "delta_10_vs_delta_0_p95_ratio": 2.0,
+  "post_compaction_vs_delta_0_p95_ratio": 1.2
+}

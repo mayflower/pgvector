@@ -86,6 +86,12 @@ typedef Pointer Item;
 #define HNSW_PAGE_KIND_TQ_ADJ			4
 #define HNSW_PAGE_KIND_TQ_EXACT			5
 #define HNSW_PAGE_KIND_TQ_CORRECTION	6
+#define HNSW_PAGE_KIND_TQ_BM25_META		7
+#define HNSW_PAGE_KIND_TQ_BM25_DOCSTATS	8
+#define HNSW_PAGE_KIND_TQ_BM25_LEXICON	9
+#define HNSW_PAGE_KIND_TQ_BM25_POSTINGS	10
+#define HNSW_PAGE_KIND_TQ_BM25_BLOCKMAX	11
+#define HNSW_PAGE_KIND_TQ_BM25_DELTA	12
 #define HNSW_PAGE_KIND_MASK				0x00ff
 #define HNSW_PAGE_GRAPH_OP_SHIFT		8
 
@@ -179,6 +185,11 @@ extern int	hnsw_tq_query_1bit_asymmetric_bits;
 extern bool hnsw_tq_build_exact_distances;
 extern bool hnsw_tq_hadamard_simd;
 extern bool hnsw_tq_exact_avx512;
+extern int	hnsw_tq_simd_force;
+extern int	hnsw_tq_exact_simd_force;
+extern int	hnsw_tq_graph_batch_scoring;
+extern int	hnsw_tq_graph_batch_size;
+extern int	hnsw_tq_graph_avx512_weighted;
 extern int	hnsw_tq_graph_lookahead_prefetch;
 extern int	hnsw_tq_graph_lookahead_threshold_kb;
 extern int	hnsw_lock_tranche_id;
@@ -234,9 +245,53 @@ typedef enum TqScoringKernel
 	TQ_SCORING_AVX2,
 	TQ_SCORING_AVX512VNNI,
 	TQ_SCORING_AVXVNNI,
+	TQ_SCORING_AVX512BW_DQ,
 	TQ_SCORING_ARM_I8MM,
 	TQ_SCORING_NEON
 }			TqScoringKernel;
+
+typedef enum TqSimdForce
+{
+	TQ_SIMD_FORCE_AUTO,
+	TQ_SIMD_FORCE_SCALAR,
+	TQ_SIMD_FORCE_AVX2,
+	TQ_SIMD_FORCE_AVXVNNI,
+	TQ_SIMD_FORCE_AVX512VNNI,
+	TQ_SIMD_FORCE_NEON,
+	TQ_SIMD_FORCE_ARM_SDOT,
+	TQ_SIMD_FORCE_ARM_I8MM
+}			TqSimdForce;
+
+typedef enum TqExactSimdForce
+{
+	TQ_EXACT_SIMD_FORCE_AUTO,
+	TQ_EXACT_SIMD_FORCE_SCALAR,
+	TQ_EXACT_SIMD_FORCE_NEON,
+	TQ_EXACT_SIMD_FORCE_AVX512F
+}			TqExactSimdForce;
+
+typedef enum TqExactKernel
+{
+	TQ_EXACT_KERNEL_SCALAR,
+	TQ_EXACT_KERNEL_AUTOVEC_FMA,
+	TQ_EXACT_KERNEL_NEON,
+	TQ_EXACT_KERNEL_AVX2,
+	TQ_EXACT_KERNEL_AVX512F
+}			TqExactKernel;
+
+typedef enum TqGraphBatchScoringMode
+{
+	TQ_GRAPH_BATCH_AUTO,
+	TQ_GRAPH_BATCH_OFF,
+	TQ_GRAPH_BATCH_ON
+}			TqGraphBatchScoringMode;
+
+typedef enum TqGraphAvx512WeightedMode
+{
+	TQ_GRAPH_AVX512_WEIGHTED_OFF,
+	TQ_GRAPH_AVX512_WEIGHTED_ON,
+	TQ_GRAPH_AVX512_WEIGHTED_AUTO
+}			TqGraphAvx512WeightedMode;
 
 typedef enum HnswIterativeScanMode
 {
@@ -528,6 +583,7 @@ typedef struct HnswMetaPageData
 	BlockNumber tqAdjStartBlkno;
 	BlockNumber tqExactStartBlkno;
 	BlockNumber tqCorrectionStartBlkno;
+	BlockNumber tqBm25MetaStartBlkno;
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -604,6 +660,9 @@ typedef struct HnswScanOpaqueData
 	MemoryContext tmpCtx;
 	int64		graphVisitedNodes;
 	int64		graphScoredCodes;
+	int64		graphBatchScoredCodes;
+	int64		graphScalarScoredCodes;
+	int			graphBatchKernel;
 	int64		graphCandidateCount;
 	int64		graphRescoreCount;
 	int64		graphRescorePages;
@@ -622,6 +681,7 @@ typedef struct HnswScanOpaqueData
 	void	   *tqGraphResults;
 	int			tqGraphResultCount;
 	int			tqGraphResultIndex;
+	void	   *tqHybridState;
 
 	/* Support functions */
 	HnswSupport support;
@@ -686,6 +746,8 @@ void		HnswRecordGraphScanStats(HnswScanOpaque so);
 void		HnswRecordNonGraphScanStats(void);
 void		HnswRecordFlatScanStats(void);
 const char *HnswTqScoringKernelName(int scoringKernel);
+const char *HnswTqSimdForceName(int force);
+const char *HnswTqExactSimdForceName(int force);
 const char *HnswStorageKindName(int storageKind);
 int			HnswGetTqBits(Relation index);
 bool		HnswGetTqWeightedOption(Relation index);
@@ -786,6 +848,10 @@ void		tqgraphendscan(IndexScanDesc scan);
 Datum		turboquanthandler(PG_FUNCTION_ARGS);
 Datum		tq_last_scan_stats(PG_FUNCTION_ARGS);
 Datum		tq_index_stats(PG_FUNCTION_ARGS);
+Datum		tq_simd_capabilities(PG_FUNCTION_ARGS);
+Datum		tq_last_simd_stats(PG_FUNCTION_ARGS);
+void		HnswRecordExactVectorKernel(int kernel);
+void		HnswRecordWeightedCodeCodeKernel(int kernel);
 
 static inline HnswNeighborArray *
 HnswGetNeighbors(char *base, HnswElement element, int lc)

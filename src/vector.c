@@ -15,6 +15,7 @@
 #include "libpq/pqformat.h"
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
+#include "tqhybrid.h"
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
@@ -77,6 +78,7 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
+	TqHybridInit();
 }
 
 /*
@@ -797,7 +799,9 @@ static float
 VectorL2SquaredDistance(int dim, float *ax, float *bx)
 {
 #if VECTOR_AVX512F_AVAILABLE
-	if (hnsw_tq_exact_avx512 && __builtin_cpu_supports("avx512f"))
+	if (hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_SCALAR &&
+		hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_NEON &&
+		hnsw_tq_exact_avx512 && __builtin_cpu_supports("avx512f"))
 		return VectorL2SquaredDistanceAvx512f(dim, ax, bx);
 #endif
 	return VectorL2SquaredDistanceAutoVec(dim, ax, bx);
@@ -807,7 +811,9 @@ static float
 VectorInnerProduct(int dim, float *ax, float *bx)
 {
 #if VECTOR_AVX512F_AVAILABLE
-	if (hnsw_tq_exact_avx512 && __builtin_cpu_supports("avx512f"))
+	if (hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_SCALAR &&
+		hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_NEON &&
+		hnsw_tq_exact_avx512 && __builtin_cpu_supports("avx512f"))
 		return VectorInnerProductAvx512f(dim, ax, bx);
 #endif
 	return VectorInnerProductAutoVec(dim, ax, bx);

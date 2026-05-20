@@ -32,13 +32,15 @@
 #define TQ_X86 0
 #endif
 
-#if defined(__AVX2__) || (TQ_X86 && (defined(__GNUC__) || defined(__clang__)))
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVX2__) || (TQ_X86 && (defined(__GNUC__) || defined(__clang__))))
 #define TQ_COMPILE_AVX2 1
 #else
 #define TQ_COMPILE_AVX2 0
 #endif
 
-#if defined(__AVX512VNNI__) || (TQ_X86 && (defined(__GNUC__) || defined(__clang__)))
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVX512VNNI__) || (TQ_X86 && (defined(__GNUC__) || defined(__clang__))))
 #define TQ_COMPILE_AVX512VNNI 1
 #else
 #define TQ_COMPILE_AVX512VNNI 0
@@ -48,9 +50,10 @@
  * AVX-VNNI runtime detection requires __builtin_cpu_supports("avxvnni"), which
  * GCC has since 11.x and Clang since 18. See tqgraph.c for the parallel guard.
  */
-#if defined(__AVXVNNI__) || \
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVXVNNI__) || \
 	(TQ_X86 && defined(__clang__) && __clang_major__ >= 18) || \
-	(TQ_X86 && defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11)
+	(TQ_X86 && defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11))
 #define TQ_COMPILE_AVXVNNI 1
 #else
 #define TQ_COMPILE_AVXVNNI 0
@@ -158,6 +161,8 @@ HnswTqScoringKernelName(int scoringKernel)
 			return "avx512vnni";
 		case TQ_SCORING_AVXVNNI:
 			return "avxvnni";
+		case TQ_SCORING_AVX512BW_DQ:
+			return "avx512bw_dq";
 		case TQ_SCORING_AVX2:
 			return "avx2";
 		case TQ_SCORING_ARM_I8MM:
@@ -167,6 +172,50 @@ HnswTqScoringKernelName(int scoringKernel)
 		case TQ_SCORING_SCALAR:
 		default:
 			return "scalar";
+	}
+}
+
+const char *
+HnswTqSimdForceName(int force)
+{
+	switch ((TqSimdForce) force)
+	{
+		case TQ_SIMD_FORCE_AUTO:
+			return "auto";
+		case TQ_SIMD_FORCE_SCALAR:
+			return "scalar";
+		case TQ_SIMD_FORCE_AVX2:
+			return "avx2";
+		case TQ_SIMD_FORCE_AVXVNNI:
+			return "avxvnni";
+		case TQ_SIMD_FORCE_AVX512VNNI:
+			return "avx512vnni";
+		case TQ_SIMD_FORCE_NEON:
+			return "neon";
+		case TQ_SIMD_FORCE_ARM_SDOT:
+			return "arm_sdot";
+		case TQ_SIMD_FORCE_ARM_I8MM:
+			return "arm_i8mm";
+		default:
+			return "unknown";
+	}
+}
+
+const char *
+HnswTqExactSimdForceName(int force)
+{
+	switch ((TqExactSimdForce) force)
+	{
+		case TQ_EXACT_SIMD_FORCE_AUTO:
+			return "auto";
+		case TQ_EXACT_SIMD_FORCE_SCALAR:
+			return "scalar";
+		case TQ_EXACT_SIMD_FORCE_NEON:
+			return "neon";
+		case TQ_EXACT_SIMD_FORCE_AVX512F:
+			return "avx512f";
+		default:
+			return "unknown";
 	}
 }
 
@@ -190,12 +239,19 @@ HnswStorageKindName(int storageKind)
 static int
 TqSelectScoringKernel(void)
 {
+	if (hnsw_tq_simd_force == TQ_SIMD_FORCE_SCALAR)
+		return TQ_SCORING_SCALAR;
+
 #if TQ_COMPILE_AVX512VNNI
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__)
-	if (hnsw_tq_graph_avx512vnni)
+	if (hnsw_tq_graph_avx512vnni &&
+		(hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		 hnsw_tq_simd_force == TQ_SIMD_FORCE_AVX512VNNI))
 		return TQ_SCORING_AVX512VNNI;
 #elif TQ_RUNTIME_AVX512VNNI
 	if (hnsw_tq_graph_avx512vnni &&
+		(hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		 hnsw_tq_simd_force == TQ_SIMD_FORCE_AVX512VNNI) &&
 		__builtin_cpu_supports("avx512vnni") &&
 		__builtin_cpu_supports("avx512vl") &&
 		__builtin_cpu_supports("avx512bw"))
@@ -205,19 +261,28 @@ TqSelectScoringKernel(void)
 
 #if TQ_COMPILE_AVXVNNI
 #if defined(__AVXVNNI__)
-	if (hnsw_tq_graph_avxvnni)
+	if (hnsw_tq_graph_avxvnni &&
+		(hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		 hnsw_tq_simd_force == TQ_SIMD_FORCE_AVXVNNI))
 		return TQ_SCORING_AVXVNNI;
 #elif TQ_RUNTIME_AVXVNNI
-	if (hnsw_tq_graph_avxvnni && __builtin_cpu_supports("avxvnni"))
+	if (hnsw_tq_graph_avxvnni &&
+		(hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		 hnsw_tq_simd_force == TQ_SIMD_FORCE_AVXVNNI) &&
+		__builtin_cpu_supports("avxvnni"))
 		return TQ_SCORING_AVXVNNI;
 #endif
 #endif
 
 #if TQ_COMPILE_AVX2
 #if defined(__AVX2__)
-	return TQ_SCORING_AVX2;
+	if (hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		hnsw_tq_simd_force == TQ_SIMD_FORCE_AVX2)
+		return TQ_SCORING_AVX2;
 #elif TQ_RUNTIME_AVX2
-	if (__builtin_cpu_supports("avx2"))
+	if ((hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		 hnsw_tq_simd_force == TQ_SIMD_FORCE_AVX2) &&
+		__builtin_cpu_supports("avx2"))
 		return TQ_SCORING_AVX2;
 #endif
 #endif
@@ -229,16 +294,24 @@ TqSelectScoringKernel(void)
 		size_t		len = sizeof(value);
 
 		if (hnsw_tq_graph_i8mm &&
+			(hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+			 hnsw_tq_simd_force == TQ_SIMD_FORCE_ARM_I8MM) &&
 			sysctlbyname("hw.optional.arm.FEAT_I8MM", &value, &len,
 						 NULL, 0) == 0 && value != 0)
 			return TQ_SCORING_ARM_I8MM;
 	}
 #elif defined(__linux__) && defined(HWCAP2_I8MM)
 	if (hnsw_tq_graph_i8mm &&
+		(hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		 hnsw_tq_simd_force == TQ_SIMD_FORCE_ARM_I8MM) &&
 		(getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0)
 		return TQ_SCORING_ARM_I8MM;
 #endif
-	return TQ_SCORING_NEON;
+	if (hnsw_tq_simd_force == TQ_SIMD_FORCE_AUTO ||
+		hnsw_tq_simd_force == TQ_SIMD_FORCE_NEON ||
+		hnsw_tq_simd_force == TQ_SIMD_FORCE_ARM_SDOT)
+		return TQ_SCORING_NEON;
+	return TQ_SCORING_SCALAR;
 #else
 	return TQ_SCORING_SCALAR;
 #endif
@@ -336,7 +409,7 @@ hash_offset(Size offset)
 #include "lib/simplehash.h"
 
 static bool
-HnswAmOidIsTurboquant(Oid amoid)
+HnswAmOidUsesNativeTqGraph(Oid amoid)
 {
 	HeapTuple	amtuple;
 	Form_pg_am	amform;
@@ -350,7 +423,8 @@ HnswAmOidIsTurboquant(Oid amoid)
 		return false;
 
 	amform = (Form_pg_am) GETSTRUCT(amtuple);
-	result = strcmp(NameStr(amform->amname), "turboquant") == 0;
+	result = strcmp(NameStr(amform->amname), "turboquant") == 0 ||
+		strcmp(NameStr(amform->amname), "turbohybrid") == 0;
 	ReleaseSysCache(amtuple);
 
 	return result;
@@ -410,7 +484,7 @@ HnswIsTurboquantIndex(Relation index)
 	relam = relform->relam;
 	ReleaseSysCache(reltuple);
 
-	if (HnswAmOidIsTurboquant(relam))
+	if (HnswAmOidUsesNativeTqGraph(relam))
 		return true;
 
 	if (index->rd_index == NULL || index->rd_indextuple == NULL)
@@ -434,7 +508,7 @@ HnswIsTurboquantIndex(Relation index)
 	relam = opclassform->opcmethod;
 	ReleaseSysCache(opclasstuple);
 
-	return HnswAmOidIsTurboquant(relam);
+	return HnswAmOidUsesNativeTqGraph(relam);
 }
 
 static int

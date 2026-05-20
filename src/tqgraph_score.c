@@ -23,13 +23,19 @@
 #define TQ_GRAPH_X86 0
 #endif
 
-#if defined(__AVX2__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__)))
+#define TQ_QUERY_SPLIT_HIGH_COEF 256
+#define TQ_GRAPH_CODEBOOK_SCALE (127.0 / 2.733)
+#define TQ_GRAPH_CODEBOOK2_SCALE (127.0 / 1.510)
+
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVX2__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__))))
 #define TQ_GRAPH_COMPILE_AVX2 1
 #else
 #define TQ_GRAPH_COMPILE_AVX2 0
 #endif
 
-#if defined(__AVX512VNNI__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__)))
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVX512VNNI__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__))))
 #define TQ_GRAPH_COMPILE_AVX512VNNI 1
 #else
 #define TQ_GRAPH_COMPILE_AVX512VNNI 0
@@ -41,9 +47,10 @@
  * LLVM JIT bitcode build of this extension on Ubuntu 24.04) rejects that
  * feature string and breaks the build, so gate accordingly.
  */
-#if defined(__AVXVNNI__) || \
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVXVNNI__) || \
 	(TQ_GRAPH_X86 && defined(__clang__) && __clang_major__ >= 18) || \
-	(TQ_GRAPH_X86 && defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11)
+	(TQ_GRAPH_X86 && defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11))
 #define TQ_GRAPH_COMPILE_AVXVNNI 1
 #else
 #define TQ_GRAPH_COMPILE_AVXVNNI 0
@@ -69,7 +76,8 @@
  * mirrors AVX-512 VNNI (broad target() attribute), runtime detection
  * is more specific because Skylake-X has VNNI but not VPOPCNTDQ.
  */
-#if defined(__AVX512VPOPCNTDQ__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__)))
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVX512VPOPCNTDQ__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__))))
 #define TQ_GRAPH_COMPILE_AVX512VPOPCNTDQ 1
 #else
 #define TQ_GRAPH_COMPILE_AVX512VPOPCNTDQ 0
@@ -83,13 +91,29 @@
 #define TQ_GRAPH_AVX512VPOPCNTDQ_TARGET
 #endif
 
+#if !defined(TQ_DISABLE_SIMD) && \
+	(defined(__AVX512F__) || (TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__))))
+#define TQ_GRAPH_COMPILE_AVX512_WEIGHTED 1
+#else
+#define TQ_GRAPH_COMPILE_AVX512_WEIGHTED 0
+#endif
+
+#if TQ_GRAPH_COMPILE_AVX512_WEIGHTED && \
+	!(defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)) && \
+	(defined(__GNUC__) || defined(__clang__))
+#define TQ_GRAPH_AVX512_WEIGHTED_TARGET __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx2")))
+#else
+#define TQ_GRAPH_AVX512_WEIGHTED_TARGET
+#endif
+
 #if TQ_GRAPH_COMPILE_AVXVNNI && !defined(__AVXVNNI__) && (defined(__GNUC__) || defined(__clang__))
 #define TQ_GRAPH_AVXVNNI_TARGET __attribute__((target("avxvnni,avx2")))
 #else
 #define TQ_GRAPH_AVXVNNI_TARGET
 #endif
 
-#if TQ_GRAPH_COMPILE_AVX2 || TQ_GRAPH_COMPILE_AVX512VNNI || TQ_GRAPH_COMPILE_AVXVNNI
+#if TQ_GRAPH_COMPILE_AVX2 || TQ_GRAPH_COMPILE_AVX512VNNI || \
+	TQ_GRAPH_COMPILE_AVXVNNI || TQ_GRAPH_COMPILE_AVX512_WEIGHTED
 #include <immintrin.h>
 #endif
 
@@ -103,7 +127,7 @@
 
 #include "tqgraph_score.h"
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(TQ_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
 #if defined(__clang__)
 #define TQ_GRAPH_ARM_DOT_TARGET __attribute__((target("dotprod")))
 #define TQ_GRAPH_COMPILE_ARM_DOT 1
@@ -120,9 +144,6 @@
 #define TQ_GRAPH_ARM_I8MM_TARGET
 #define TQ_GRAPH_COMPILE_ARM_I8MM 0
 #endif
-#define TQ_QUERY_SPLIT_HIGH_COEF 256
-#define TQ_GRAPH_CODEBOOK_SCALE (127.0 / 2.733)
-#define TQ_GRAPH_CODEBOOK2_SCALE (127.0 / 1.510)
 static const int8 TqGraphCodebookI8[TQ_LUT_WIDTH] = {
 	-127, -96, -75, -58, -44, -31, -18, -6,
 	6, 18, 31, 44, 58, 75, 96, 127
@@ -137,9 +158,6 @@ static const int8 TqGraphCodebook2I8[TQ_LUT_WIDTH] = {
 #endif
 
 #if TQ_GRAPH_COMPILE_AVX2 && !TQ_GRAPH_COMPILE_ARM_DOT
-#define TQ_QUERY_SPLIT_HIGH_COEF 256
-#define TQ_GRAPH_CODEBOOK_SCALE (127.0 / 2.733)
-#define TQ_GRAPH_CODEBOOK2_SCALE (127.0 / 1.510)
 static const int8 TqGraphCodebookI8[TQ_LUT_WIDTH] = {
 	-127, -96, -75, -58, -44, -31, -18, -6,
 	6, 18, 31, 44, 58, 75, 96, 127
@@ -163,7 +181,9 @@ static const int8 TqGraphCodebook2PairOddI8[16] = {
 };
 #endif
 
-#if TQ_GRAPH_COMPILE_ARM_DOT || TQ_GRAPH_COMPILE_AVX2 || TQ_GRAPH_COMPILE_AVX512VNNI || TQ_GRAPH_COMPILE_AVXVNNI
+#if TQ_GRAPH_COMPILE_ARM_DOT || TQ_GRAPH_COMPILE_AVX2 || \
+	TQ_GRAPH_COMPILE_AVX512VNNI || TQ_GRAPH_COMPILE_AVXVNNI || \
+	TQ_GRAPH_COMPILE_AVX512_WEIGHTED
 #define TQ_GRAPH_COMPILE_QUERY_SPLIT 1
 #else
 #define TQ_GRAPH_COMPILE_QUERY_SPLIT 0
@@ -438,6 +458,15 @@ TqGraphCodeCodeRawAvx512Vnni(const uint8 *a, const uint8 *b, int dim,
 static int64 TQ_GRAPH_AVX512VNNI_TARGET
 TqGraphCodeCode2RawAvx512Vnni(const uint8 *a, const uint8 *b, int dim,
 							  int *sampleDims);
+#endif
+#if TQ_GRAPH_COMPILE_AVX512_WEIGHTED
+static bool TqGraphAvx512WeightedAvailable(void);
+static int64 TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphCodeCodeWeightedRawAvx512(const uint8 *a, const uint8 *b,
+								 const int16 *weights, int dim);
+static int64 TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphCodeCode2WeightedRawAvx512(const uint8 *a, const uint8 *b,
+								  const int16 *weights, int dim);
 #endif
 #if TQ_GRAPH_COMPILE_AVXVNNI
 static bool TqGraphAvxVnniAvailable(void);
@@ -922,8 +951,23 @@ TqGraphBuildCodeCodeWeighted(TqGraphBuildState *state, uint32 a, uint32 b,
 		else
 			codebookScaleSq = TQ_GRAPH_CODEBOOK2_SCALE * TQ_GRAPH_CODEBOOK2_SCALE;
 
+#if TQ_GRAPH_COMPILE_AVX512_WEIGHTED
+		if (!simdRan && TqGraphAvx512WeightedAvailable())
+		{
+			if (state->tqBits == TQ_DEFAULT_BITS)
+				rawI64 = TqGraphCodeCodeWeightedRawAvx512(aNode->code, bNode->code,
+														  state->dPrimeSqI16,
+														  state->dimensions);
+			else
+				rawI64 = TqGraphCodeCode2WeightedRawAvx512(aNode->code, bNode->code,
+														   state->dPrimeSqI16,
+														   state->dimensions);
+			HnswRecordWeightedCodeCodeKernel(TQ_SCORING_AVX512BW_DQ);
+			simdRan = true;
+		}
+#endif
 #if TQ_GRAPH_COMPILE_ARM_DOT
-		if (!simdRan)
+		if (!simdRan && TqGraphArmDotprodAvailable())
 		{
 			if (state->tqBits == TQ_DEFAULT_BITS)
 				rawI64 = TqGraphCodeCodeWeightedRawNeonSdot(aNode->code, bNode->code,
@@ -933,6 +977,7 @@ TqGraphBuildCodeCodeWeighted(TqGraphBuildState *state, uint32 a, uint32 b,
 				rawI64 = TqGraphCodeCode2WeightedRawNeonSdot(aNode->code, bNode->code,
 															  state->dPrimeSqI16,
 															  state->dimensions);
+			HnswRecordWeightedCodeCodeKernel(TQ_SCORING_NEON);
 			simdRan = true;
 		}
 #endif
@@ -947,6 +992,7 @@ TqGraphBuildCodeCodeWeighted(TqGraphBuildState *state, uint32 a, uint32 b,
 				rawI64 = TqGraphCodeCode2WeightedRawAvx2(aNode->code, bNode->code,
 														  state->dPrimeSqI16,
 														  state->dimensions);
+			HnswRecordWeightedCodeCodeKernel(TQ_SCORING_AVX2);
 			simdRan = true;
 		}
 #endif
@@ -954,12 +1000,16 @@ TqGraphBuildCodeCodeWeighted(TqGraphBuildState *state, uint32 a, uint32 b,
 		if (simdRan)
 			raw = (double) rawI64 / ((double) state->weightScale * codebookScaleSq);
 		else
+		{
+			HnswRecordWeightedCodeCodeKernel(TQ_SCORING_SCALAR);
 			raw = TqGraphCodeCodeWeightedRawScalar(aNode->code, bNode->code,
 												   state->dimensions, state->tqBits,
 												   state->ecScale);
+		}
 	}
 	else
 	{
+		HnswRecordWeightedCodeCodeKernel(TQ_SCORING_SCALAR);
 		raw = TqGraphCodeCodeWeightedRawScalar(aNode->code, bNode->code,
 											   state->dimensions, state->tqBits,
 											   state->ecScale);
@@ -1102,6 +1152,10 @@ static bool
 TqGraphAvx2Available(void)
 {
 	static int	available = -1;
+
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_AVX2)
+		return false;
 
 	if (available >= 0)
 		return available != 0;
@@ -1375,6 +1429,153 @@ TqGraphCodeCode2WeightedRawAvx2(const uint8 *a, const uint8 *b,
 	return TqGraphHorizontalSumI64Avx2(acc);
 }
 
+#if TQ_GRAPH_COMPILE_AVX512_WEIGHTED
+static bool
+TqGraphAvx512WeightedAvailable(void)
+{
+	static int	available = -1;
+
+	if (hnsw_tq_graph_avx512_weighted == TQ_GRAPH_AVX512_WEIGHTED_OFF ||
+		hnsw_tq_simd_force == TQ_SIMD_FORCE_SCALAR)
+		return false;
+
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_AVX512VNNI)
+		return false;
+
+	if (available >= 0)
+		return available != 0;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__)
+	available = 1;
+#elif TQ_GRAPH_X86 && (defined(__GNUC__) || defined(__clang__))
+	available = __builtin_cpu_supports("avx512f") &&
+		__builtin_cpu_supports("avx512bw") &&
+		__builtin_cpu_supports("avx512dq") &&
+		__builtin_cpu_supports("avx512vl") ? 1 : 0;
+#else
+	available = 0;
+#endif
+	return available != 0;
+}
+
+static inline int64 TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphHorizontalSumI32x16Avx512(__m512i v)
+{
+	int32		s[16];
+	int64		sum = 0;
+
+	_mm512_storeu_si512((__m512i *) s, v);
+	for (int i = 0; i < 16; i++)
+		sum += s[i];
+
+	return sum;
+}
+
+static inline __m256i TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphExpandPacked4x32Avx512(const uint8 *code)
+{
+	__m128i		lo = TqGraphExpandPacked4Avx2(code);
+	__m128i		hi = TqGraphExpandPacked4Avx2(code + 8);
+
+	return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+static inline __m256i TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphExpandPacked2x32Avx512(const uint8 *code)
+{
+	__m128i		lo = TqGraphExpandPacked2Avx2(code);
+	__m128i		hi = TqGraphExpandPacked2Avx2(code + 4);
+
+	return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+static inline int64 TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphWeightedDotI8x32Avx512(__m256i ca, __m256i cb,
+							  const int16 *weightsAt)
+{
+	__m512i		caI16 = _mm512_cvtepi8_epi16(ca);
+	__m512i		cbI16 = _mm512_cvtepi8_epi16(cb);
+	__m512i		prod = _mm512_mullo_epi16(caI16, cbI16);
+	__m512i		w = _mm512_loadu_si512((const __m512i *) weightsAt);
+	__m512i		pw = _mm512_madd_epi16(prod, w);
+
+	return TqGraphHorizontalSumI32x16Avx512(pw);
+}
+
+static int64 TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphCodeCodeWeightedRawAvx512(const uint8 *a, const uint8 *b,
+								 const int16 *weights, int dim)
+{
+	int64		acc = 0;
+	int			chunks = dim / 32;
+	int			tailDims = dim - chunks * 32;
+
+	for (int chunk = 0; chunk < chunks; chunk++)
+	{
+		__m256i		ca = TqGraphExpandPacked4x32Avx512(a + chunk * 16);
+		__m256i		cb = TqGraphExpandPacked4x32Avx512(b + chunk * 16);
+
+		acc += TqGraphWeightedDotI8x32Avx512(ca, cb, weights + chunk * 32);
+	}
+
+	if (tailDims != 0)
+	{
+		uint8		scratchA[16] = {0};
+		uint8		scratchB[16] = {0};
+		int16		scratchW[32] = {0};
+		int			tailBytes = (tailDims + 1) / 2;
+		__m256i		ca;
+		__m256i		cb;
+
+		memcpy(scratchA, a + chunks * 16, tailBytes);
+		memcpy(scratchB, b + chunks * 16, tailBytes);
+		memcpy(scratchW, weights + chunks * 32, sizeof(int16) * tailDims);
+		ca = TqGraphExpandPacked4x32Avx512(scratchA);
+		cb = TqGraphExpandPacked4x32Avx512(scratchB);
+		acc += TqGraphWeightedDotI8x32Avx512(ca, cb, scratchW);
+	}
+
+	return acc;
+}
+
+static int64 TQ_GRAPH_AVX512_WEIGHTED_TARGET
+TqGraphCodeCode2WeightedRawAvx512(const uint8 *a, const uint8 *b,
+								  const int16 *weights, int dim)
+{
+	int64		acc = 0;
+	int			chunks = dim / 32;
+	int			tailDims = dim - chunks * 32;
+
+	for (int chunk = 0; chunk < chunks; chunk++)
+	{
+		__m256i		ca = TqGraphExpandPacked2x32Avx512(a + chunk * 8);
+		__m256i		cb = TqGraphExpandPacked2x32Avx512(b + chunk * 8);
+
+		acc += TqGraphWeightedDotI8x32Avx512(ca, cb, weights + chunk * 32);
+	}
+
+	if (tailDims != 0)
+	{
+		uint8		scratchA[8] = {0};
+		uint8		scratchB[8] = {0};
+		int16		scratchW[32] = {0};
+		int			tailBytes = (tailDims + 3) / 4;
+		__m256i		ca;
+		__m256i		cb;
+
+		memcpy(scratchA, a + chunks * 8, tailBytes);
+		memcpy(scratchB, b + chunks * 8, tailBytes);
+		memcpy(scratchW, weights + chunks * 32, sizeof(int16) * tailDims);
+		ca = TqGraphExpandPacked2x32Avx512(scratchA);
+		cb = TqGraphExpandPacked2x32Avx512(scratchB);
+		acc += TqGraphWeightedDotI8x32Avx512(ca, cb, scratchW);
+	}
+
+	return acc;
+}
+#endif
+
 static int64 TQ_GRAPH_AVX2_TARGET
 TqGraphCodeCodeRawAvx2(const uint8 *a, const uint8 *b, int dim,
 					   int *sampleDims)
@@ -1471,6 +1672,9 @@ TqGraphAvx512VnniAvailable(void)
 	 * restarting the backend.  The CPU-feature probe is still memoised.
 	 */
 	if (!hnsw_tq_graph_avx512vnni)
+		return false;
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_AVX512VNNI)
 		return false;
 
 	if (available >= 0)
@@ -1953,6 +2157,9 @@ TqGraphAvxVnniAvailable(void)
 
 	/* GUC kill-switch — see hnsw.tq_graph_avxvnni in hnsw.c. */
 	if (!hnsw_tq_graph_avxvnni)
+		return false;
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_AVXVNNI)
 		return false;
 
 	if (available >= 0)
@@ -2502,15 +2709,32 @@ TqGraphExactVectorDistance(HnswScanOpaque so, Datum query, char *valuePtr)
 
 	if (queryVector == NULL || valueVector == NULL ||
 		queryVector->dim != valueVector->dim || !so->tq.enabled)
+	{
+		if (so->support.procinfo == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("turboquant exact distance support function is missing")));
+		HnswRecordExactVectorKernel(hnsw_tq_exact_simd_force == TQ_EXACT_SIMD_FORCE_SCALAR ?
+									TQ_EXACT_KERNEL_SCALAR :
+									TQ_EXACT_KERNEL_AUTOVEC_FMA);
 		return TqGraphExactDistance(&so->support, query, PointerGetDatum(valuePtr));
+	}
 
 	mode = (TqScoreMode) so->tq.scoreMode;
 #if TQ_GRAPH_COMPILE_AVX2
-	if (TqGraphAvx2Available() &&
+	if (hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_SCALAR &&
+		TqGraphAvx2Available() &&
 		TqGraphExactVectorDistanceAvx2(so, queryVector, valueVector, &distance))
+	{
+		HnswRecordExactVectorKernel(TQ_EXACT_KERNEL_AVX2);
 		return distance;
+	}
 #endif
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(TQ_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
+	if (hnsw_tq_exact_simd_force == TQ_EXACT_SIMD_FORCE_SCALAR ||
+		hnsw_tq_exact_simd_force == TQ_EXACT_SIMD_FORCE_AVX512F)
+		goto scalar_exact_distance;
+
 	if (mode == TQ_SCORE_L2)
 	{
 		float32x4_t acc0 = vdupq_n_f32(0);
@@ -2558,28 +2782,65 @@ TqGraphExactVectorDistance(HnswScanOpaque so, Datum query, char *valuePtr)
 			distance += diff * diff;
 		}
 
+		HnswRecordExactVectorKernel(TQ_EXACT_KERNEL_NEON);
 		return distance;
 	}
 
 	if (mode == TQ_SCORE_IP || mode == TQ_SCORE_COSINE)
 	{
-		float32x4_t dotAcc = vdupq_n_f32(0);
-		float32x4_t normAcc = vdupq_n_f32(0);
+		float32x4_t dotAcc0 = vdupq_n_f32(0);
+		float32x4_t dotAcc1 = vdupq_n_f32(0);
+		float32x4_t dotAcc2 = vdupq_n_f32(0);
+		float32x4_t dotAcc3 = vdupq_n_f32(0);
+		float32x4_t normAcc0 = vdupq_n_f32(0);
+		float32x4_t normAcc1 = vdupq_n_f32(0);
+		float32x4_t normAcc2 = vdupq_n_f32(0);
+		float32x4_t normAcc3 = vdupq_n_f32(0);
 		int			i = 0;
+
+		for (; i + 16 <= queryVector->dim; i += 16)
+		{
+			float32x4_t qv0 = vld1q_f32(&queryVector->x[i]);
+			float32x4_t qv1 = vld1q_f32(&queryVector->x[i + 4]);
+			float32x4_t qv2 = vld1q_f32(&queryVector->x[i + 8]);
+			float32x4_t qv3 = vld1q_f32(&queryVector->x[i + 12]);
+			float32x4_t vv0 = vld1q_f32(&valueVector->x[i]);
+			float32x4_t vv1 = vld1q_f32(&valueVector->x[i + 4]);
+			float32x4_t vv2 = vld1q_f32(&valueVector->x[i + 8]);
+			float32x4_t vv3 = vld1q_f32(&valueVector->x[i + 12]);
+
+			dotAcc0 = vfmaq_f32(dotAcc0, qv0, vv0);
+			dotAcc1 = vfmaq_f32(dotAcc1, qv1, vv1);
+			dotAcc2 = vfmaq_f32(dotAcc2, qv2, vv2);
+			dotAcc3 = vfmaq_f32(dotAcc3, qv3, vv3);
+			if (mode == TQ_SCORE_COSINE)
+			{
+				normAcc0 = vfmaq_f32(normAcc0, vv0, vv0);
+				normAcc1 = vfmaq_f32(normAcc1, vv1, vv1);
+				normAcc2 = vfmaq_f32(normAcc2, vv2, vv2);
+				normAcc3 = vfmaq_f32(normAcc3, vv3, vv3);
+			}
+		}
+
+		dotAcc0 = vaddq_f32(vaddq_f32(dotAcc0, dotAcc1),
+							vaddq_f32(dotAcc2, dotAcc3));
+		if (mode == TQ_SCORE_COSINE)
+			normAcc0 = vaddq_f32(vaddq_f32(normAcc0, normAcc1),
+								 vaddq_f32(normAcc2, normAcc3));
 
 		for (; i + 4 <= queryVector->dim; i += 4)
 		{
 			float32x4_t qv = vld1q_f32(&queryVector->x[i]);
 			float32x4_t vv = vld1q_f32(&valueVector->x[i]);
 
-			dotAcc = vfmaq_f32(dotAcc, qv, vv);
+			dotAcc0 = vfmaq_f32(dotAcc0, qv, vv);
 			if (mode == TQ_SCORE_COSINE)
-				normAcc = vfmaq_f32(normAcc, vv, vv);
+				normAcc0 = vfmaq_f32(normAcc0, vv, vv);
 		}
 
-		dot = (double) vaddvq_f32(dotAcc);
+		dot = (double) vaddvq_f32(dotAcc0);
 		if (mode == TQ_SCORE_COSINE)
-			valueNorm = (double) vaddvq_f32(normAcc);
+			valueNorm = (double) vaddvq_f32(normAcc0);
 
 		for (; i < queryVector->dim; i++)
 		{
@@ -2594,6 +2855,7 @@ TqGraphExactVectorDistance(HnswScanOpaque so, Datum query, char *valuePtr)
 		if (mode == TQ_SCORE_IP)
 			return -dot;
 
+		HnswRecordExactVectorKernel(TQ_EXACT_KERNEL_NEON);
 		if (so->tq.queryNorm == 0 || valueNorm == 0)
 			return 1;
 
@@ -2601,6 +2863,9 @@ TqGraphExactVectorDistance(HnswScanOpaque so, Datum query, char *valuePtr)
 	}
 #endif
 
+#if !defined(TQ_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
+scalar_exact_distance:
+#endif
 	for (int i = 0; i < queryVector->dim; i++)
 	{
 		double		qv = queryVector->x[i];
@@ -2623,19 +2888,29 @@ TqGraphExactVectorDistance(HnswScanOpaque so, Datum query, char *valuePtr)
 	}
 
 	if (mode == TQ_SCORE_L1 || mode == TQ_SCORE_L2)
+	{
+		HnswRecordExactVectorKernel(TQ_EXACT_KERNEL_SCALAR);
 		return distance;
+	}
 
 	if (mode == TQ_SCORE_IP)
+	{
+		HnswRecordExactVectorKernel(TQ_EXACT_KERNEL_SCALAR);
 		return -dot;
+	}
 
 	if (mode == TQ_SCORE_COSINE)
 	{
+		HnswRecordExactVectorKernel(TQ_EXACT_KERNEL_SCALAR);
 		if (so->tq.queryNorm == 0 || valueNorm == 0)
 			return 1;
 
 		return 1 - (dot / sqrt(so->tq.queryNorm * valueNorm));
 	}
 
+	HnswRecordExactVectorKernel(hnsw_tq_exact_simd_force == TQ_EXACT_SIMD_FORCE_SCALAR ?
+								TQ_EXACT_KERNEL_SCALAR :
+								TQ_EXACT_KERNEL_AUTOVEC_FMA);
 	return TqGraphExactDistance(&so->support, query, PointerGetDatum(valuePtr));
 }
 
@@ -2985,6 +3260,9 @@ TqGraphAvx512VpopcntdqAvailable(void)
 	 * resetting `available`.
 	 */
 	if (!hnsw_tq_graph_avx512vpopcntdq)
+		return false;
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_AVX512VNNI)
 		return false;
 
 	if (available >= 0)
@@ -3376,6 +3654,101 @@ TqGraphBuildExactVectorDistance(TqGraphBuildState *state, uint32 a, uint32 b)
 
 		return distance;
 	}
+
+	if (mode == TQ_SCORE_IP || mode == TQ_SCORE_COSINE)
+	{
+		float32x4_t dotAcc0 = vdupq_n_f32(0);
+		float32x4_t dotAcc1 = vdupq_n_f32(0);
+		float32x4_t dotAcc2 = vdupq_n_f32(0);
+		float32x4_t dotAcc3 = vdupq_n_f32(0);
+		float32x4_t aNormAcc0 = vdupq_n_f32(0);
+		float32x4_t aNormAcc1 = vdupq_n_f32(0);
+		float32x4_t aNormAcc2 = vdupq_n_f32(0);
+		float32x4_t aNormAcc3 = vdupq_n_f32(0);
+		float32x4_t bNormAcc0 = vdupq_n_f32(0);
+		float32x4_t bNormAcc1 = vdupq_n_f32(0);
+		float32x4_t bNormAcc2 = vdupq_n_f32(0);
+		float32x4_t bNormAcc3 = vdupq_n_f32(0);
+		int			i = 0;
+
+		for (; i + 16 <= av->dim; i += 16)
+		{
+			float32x4_t av0 = vld1q_f32(&av->x[i]);
+			float32x4_t av1 = vld1q_f32(&av->x[i + 4]);
+			float32x4_t av2 = vld1q_f32(&av->x[i + 8]);
+			float32x4_t av3 = vld1q_f32(&av->x[i + 12]);
+			float32x4_t bv0 = vld1q_f32(&bv->x[i]);
+			float32x4_t bv1 = vld1q_f32(&bv->x[i + 4]);
+			float32x4_t bv2 = vld1q_f32(&bv->x[i + 8]);
+			float32x4_t bv3 = vld1q_f32(&bv->x[i + 12]);
+
+			dotAcc0 = vfmaq_f32(dotAcc0, av0, bv0);
+			dotAcc1 = vfmaq_f32(dotAcc1, av1, bv1);
+			dotAcc2 = vfmaq_f32(dotAcc2, av2, bv2);
+			dotAcc3 = vfmaq_f32(dotAcc3, av3, bv3);
+			if (mode == TQ_SCORE_COSINE)
+			{
+				aNormAcc0 = vfmaq_f32(aNormAcc0, av0, av0);
+				aNormAcc1 = vfmaq_f32(aNormAcc1, av1, av1);
+				aNormAcc2 = vfmaq_f32(aNormAcc2, av2, av2);
+				aNormAcc3 = vfmaq_f32(aNormAcc3, av3, av3);
+				bNormAcc0 = vfmaq_f32(bNormAcc0, bv0, bv0);
+				bNormAcc1 = vfmaq_f32(bNormAcc1, bv1, bv1);
+				bNormAcc2 = vfmaq_f32(bNormAcc2, bv2, bv2);
+				bNormAcc3 = vfmaq_f32(bNormAcc3, bv3, bv3);
+			}
+		}
+
+		dotAcc0 = vaddq_f32(vaddq_f32(dotAcc0, dotAcc1),
+							vaddq_f32(dotAcc2, dotAcc3));
+		if (mode == TQ_SCORE_COSINE)
+		{
+			aNormAcc0 = vaddq_f32(vaddq_f32(aNormAcc0, aNormAcc1),
+								  vaddq_f32(aNormAcc2, aNormAcc3));
+			bNormAcc0 = vaddq_f32(vaddq_f32(bNormAcc0, bNormAcc1),
+								  vaddq_f32(bNormAcc2, bNormAcc3));
+		}
+
+		for (; i + 4 <= av->dim; i += 4)
+		{
+			float32x4_t avv = vld1q_f32(&av->x[i]);
+			float32x4_t bvv = vld1q_f32(&bv->x[i]);
+
+			dotAcc0 = vfmaq_f32(dotAcc0, avv, bvv);
+			if (mode == TQ_SCORE_COSINE)
+			{
+				aNormAcc0 = vfmaq_f32(aNormAcc0, avv, avv);
+				bNormAcc0 = vfmaq_f32(bNormAcc0, bvv, bvv);
+			}
+		}
+
+		dot = (double) vaddvq_f32(dotAcc0);
+		if (mode == TQ_SCORE_COSINE)
+		{
+			aNorm = (double) vaddvq_f32(aNormAcc0);
+			bNorm = (double) vaddvq_f32(bNormAcc0);
+		}
+
+		for (; i < av->dim; i++)
+		{
+			double		aval = av->x[i];
+			double		bval = bv->x[i];
+
+			dot += aval * bval;
+			if (mode == TQ_SCORE_COSINE)
+			{
+				aNorm += aval * aval;
+				bNorm += bval * bval;
+			}
+		}
+
+		if (mode == TQ_SCORE_IP)
+			return -dot;
+		if (aNorm == 0 || bNorm == 0)
+			return 1;
+
+		return 1 - (dot / sqrt(aNorm * bNorm));
+	}
 #endif
 
 	for (int i = 0; i < av->dim; i++)
@@ -3486,6 +3859,7 @@ TqGraphScoreNode(HnswScanOpaque so, TqGraphScanNode *node)
 		return 0;
 
 	so->graphScoredCodes++;
+	so->graphScalarScoredCodes++;
 
 	/*
 	 * Asymmetric 1-bit single-node fast path.  Mirrors the
@@ -3534,6 +3908,11 @@ TqGraphArmDotprodAvailable(void)
 {
 	static int	available = -1;
 
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_ARM_SDOT &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_NEON)
+		return false;
+
 	if (available >= 0)
 		return available != 0;
 
@@ -3565,6 +3944,9 @@ TqGraphArmI8mmAvailable(void)
 	static int	available = -1;
 
 	if (!hnsw_tq_graph_i8mm)
+		return false;
+	if (hnsw_tq_simd_force != TQ_SIMD_FORCE_AUTO &&
+		hnsw_tq_simd_force != TQ_SIMD_FORCE_ARM_I8MM)
 		return false;
 
 	if (available >= 0)
@@ -4142,6 +4524,8 @@ TqGraphScoreNodeBatchQuerySplit4(HnswScanOpaque so,
 	}
 
 	so->graphScoredCodes += 4;
+	so->graphBatchScoredCodes += 4;
+	so->graphBatchKernel = so->tq.scoringKernel;
 	return true;
 }
 
@@ -4217,6 +4601,8 @@ TqGraphScoreNodeBatchQuerySplit2(HnswScanOpaque so,
 	}
 
 	so->graphScoredCodes += 4;
+	so->graphBatchScoredCodes += 4;
+	so->graphBatchKernel = so->tq.scoringKernel;
 	return true;
 }
 
@@ -4294,6 +4680,8 @@ TqGraphScoreNodeBatchPacked4(HnswScanOpaque so, TqGraphScanStorage *storage,
 	}
 
 	so->graphScoredCodes += 4;
+	so->graphBatchScoredCodes += 4;
+	so->graphBatchKernel = TQ_SCORING_SCALAR;
 	return true;
 }
 
@@ -4427,6 +4815,8 @@ TqGraphScoreNodeBatchPackedLowBits(HnswScanOpaque so,
 	}
 
 	so->graphScoredCodes += 4;
+	so->graphBatchScoredCodes += 4;
+	so->graphBatchKernel = TQ_SCORING_SCALAR;
 	return true;
 }
 
@@ -4500,6 +4890,8 @@ TqGraphScoreNodeBatchAsymBit1(HnswScanOpaque so,
 	}
 
 	so->graphScoredCodes += 4;
+	so->graphBatchScoredCodes += 4;
+	so->graphBatchKernel = so->tq.scoringKernel;
 	return true;
 }
 
@@ -4554,6 +4946,8 @@ TqGraphScoreNodeBatchPopcntLowBits(HnswScanOpaque so,
 	}
 
 	so->graphScoredCodes += 4;
+	so->graphBatchScoredCodes += 4;
+	so->graphBatchKernel = TQ_SCORING_SCALAR;
 	return true;
 }
 
@@ -4562,6 +4956,14 @@ TqGraphScoreNodeBatch(HnswScanOpaque so, TqGraphScanStorage *storage,
 					  uint32 *nodeIds, int nodeCount, double *distances,
 					  Datum query)
 {
+	if (hnsw_tq_graph_batch_scoring == TQ_GRAPH_BATCH_OFF ||
+		hnsw_tq_graph_batch_size < 4)
+	{
+		for (int i = 0; i < nodeCount; i++)
+			distances[i] = TqGraphScoreNode(so, &storage->nodes[nodeIds[i]]);
+		return;
+	}
+
 	if (TqGraphUseExactLowBitRouting(so, query))
 	{
 		bool		exactBatch = true;
@@ -4596,28 +4998,29 @@ TqGraphScoreNodeBatch(HnswScanOpaque so, TqGraphScanStorage *storage,
 				TQ_GRAPH_PREFETCH_READ(node->code);
 		}
 
-		if (i + 4 <= nodeCount &&
-#if TQ_GRAPH_COMPILE_QUERY_SPLIT
-			(TqGraphScoreNodeBatchQuerySplit4(so, storage, nodeIds + i,
-											  distances + i) ||
-			 TqGraphScoreNodeBatchQuerySplit2(so, storage, nodeIds + i,
-											  distances + i) ||
-#endif
-			TqGraphScoreNodeBatchPacked4(so, storage, nodeIds + i,
-										 distances + i) ||
-			TqGraphScoreNodeBatchAsymBit1(so, storage, nodeIds + i,
-										  distances + i) ||
-			TqGraphScoreNodeBatchPopcntLowBits(so, storage, nodeIds + i,
-											   distances + i) ||
-			TqGraphScoreNodeBatchPackedLowBits(so, storage, nodeIds + i,
-											   distances + i)
-#if TQ_GRAPH_COMPILE_QUERY_SPLIT
-			)
-#endif
-			)
+		if (i + 4 <= nodeCount)
 		{
-			i += 4;
-			continue;
+			bool		batchScored =
+#if TQ_GRAPH_COMPILE_QUERY_SPLIT
+				TqGraphScoreNodeBatchQuerySplit4(so, storage, nodeIds + i,
+												 distances + i) ||
+				TqGraphScoreNodeBatchQuerySplit2(so, storage, nodeIds + i,
+												 distances + i) ||
+#endif
+				TqGraphScoreNodeBatchPacked4(so, storage, nodeIds + i,
+											 distances + i) ||
+				TqGraphScoreNodeBatchAsymBit1(so, storage, nodeIds + i,
+											  distances + i) ||
+				TqGraphScoreNodeBatchPopcntLowBits(so, storage, nodeIds + i,
+												   distances + i) ||
+				TqGraphScoreNodeBatchPackedLowBits(so, storage, nodeIds + i,
+												   distances + i);
+
+			if (batchScored)
+			{
+				i += 4;
+				continue;
+			}
 		}
 
 		distances[i] = TqGraphScoreNode(so, &storage->nodes[nodeIds[i]]);

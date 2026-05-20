@@ -36,6 +36,7 @@
 #include "utils/spccache.h"
 #include "vector.h"
 #include "tqgraph.h"
+#include "tqhybrid_bm25.h"
 
 #if PG_VERSION_NUM < 150000
 #define MarkGUCPrefixReserved(x) EmitWarningsOnPlaceholders(x)
@@ -83,6 +84,40 @@ static const struct config_enum_entry tq_graph_lookahead_prefetch_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry tq_simd_force_options[] = {
+	{"auto", TQ_SIMD_FORCE_AUTO, false},
+	{"scalar", TQ_SIMD_FORCE_SCALAR, false},
+	{"avx2", TQ_SIMD_FORCE_AVX2, false},
+	{"avxvnni", TQ_SIMD_FORCE_AVXVNNI, false},
+	{"avx512vnni", TQ_SIMD_FORCE_AVX512VNNI, false},
+	{"neon", TQ_SIMD_FORCE_NEON, false},
+	{"arm_sdot", TQ_SIMD_FORCE_ARM_SDOT, false},
+	{"arm_i8mm", TQ_SIMD_FORCE_ARM_I8MM, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry tq_exact_simd_force_options[] = {
+	{"auto", TQ_EXACT_SIMD_FORCE_AUTO, false},
+	{"scalar", TQ_EXACT_SIMD_FORCE_SCALAR, false},
+	{"neon", TQ_EXACT_SIMD_FORCE_NEON, false},
+	{"avx512f", TQ_EXACT_SIMD_FORCE_AVX512F, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry tq_graph_batch_scoring_options[] = {
+	{"auto", TQ_GRAPH_BATCH_AUTO, false},
+	{"off", TQ_GRAPH_BATCH_OFF, false},
+	{"on", TQ_GRAPH_BATCH_ON, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry tq_graph_avx512_weighted_options[] = {
+	{"off", TQ_GRAPH_AVX512_WEIGHTED_OFF, false},
+	{"on", TQ_GRAPH_AVX512_WEIGHTED_ON, false},
+	{"auto", TQ_GRAPH_AVX512_WEIGHTED_AUTO, false},
+	{NULL, 0, false}
+};
+
 int			hnsw_ef_search;
 int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
@@ -101,6 +136,11 @@ int			hnsw_tq_query_1bit_asymmetric_bits;
 bool		hnsw_tq_build_exact_distances;
 bool		hnsw_tq_hadamard_simd;
 bool		hnsw_tq_exact_avx512;
+int			hnsw_tq_simd_force;
+int			hnsw_tq_exact_simd_force;
+int			hnsw_tq_graph_batch_scoring;
+int			hnsw_tq_graph_batch_size;
+int			hnsw_tq_graph_avx512_weighted;
 int			hnsw_tq_graph_lookahead_prefetch;
 int			hnsw_tq_graph_lookahead_threshold_kb;
 int			hnsw_lock_tranche_id;
@@ -474,6 +514,40 @@ HnswInit(void)
 							 &hnsw_tq_exact_avx512,
 							 false, PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomEnumVariable("hnsw.tq_simd_force", "Force or disable native TurboQuant dense SIMD dispatch",
+							 "auto uses runtime CPU detection; scalar disables dense SIMD; specific values are honored only when the build and CPU support them, otherwise the dispatcher safely falls back.",
+							 &hnsw_tq_simd_force,
+							 TQ_SIMD_FORCE_AUTO,
+							 tq_simd_force_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("hnsw.tq_exact_simd_force", "Force or disable exact vector SIMD dispatch",
+							 "auto uses the normal exact-distance dispatch; scalar disables explicit exact SIMD; architecture-specific values are honored only when safe.",
+							 &hnsw_tq_exact_simd_force,
+							 TQ_EXACT_SIMD_FORCE_AUTO,
+							 tq_exact_simd_force_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("hnsw.tq_graph_batch_scoring", "Control native TurboQuant dense graph batch scoring",
+							 "auto and on score supported neighbor groups in batches; off routes every candidate through the single-node scorer for parity and benchmarking.",
+							 &hnsw_tq_graph_batch_scoring,
+							 TQ_GRAPH_BATCH_AUTO,
+							 tq_graph_batch_scoring_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.tq_graph_batch_size", "Preferred native TurboQuant dense graph batch size",
+							"The current batch kernels process groups of four. Values above four are accepted for benchmark matrix compatibility and use the four-wide kernel until wider kernels are available.",
+							&hnsw_tq_graph_batch_size,
+							4, 1, 8,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("hnsw.tq_graph_avx512_weighted", "Control AVX-512 weighted TurboQuant+ code-code scoring",
+							 "off keeps weighted TQ+ on scalar/AVX2/NEON paths; on and auto allow the AVX-512BW/DQ weighted kernel when the CPU supports it. Default off because wide AVX-512 can downclock on some hosts.",
+							 &hnsw_tq_graph_avx512_weighted,
+							 TQ_GRAPH_AVX512_WEIGHTED_OFF,
+							 tq_graph_avx512_weighted_options,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomEnumVariable("hnsw.tq_graph_lookahead_prefetch", "Adjacency-list look-ahead prefetch in the inner neighbor scan loop",
 							 "auto = enable when the per-scan metadata working set (storage->nodes + visitedGeneration) exceeds hnsw.tq_graph_lookahead_threshold_kb.  off = always disabled.  on = always enabled.  Default auto: keeps small-corpus scans (where the hardware prefetcher already covers the access pattern) regression-free while turning on for >L3-sized corpora where the explicit hint wins.",
 							 &hnsw_tq_graph_lookahead_prefetch,
@@ -798,6 +872,7 @@ tq_index_stats(PG_FUNCTION_ARGS)
 	uint16		tqFlags;
 	uint16		tqBits;
 	BlockNumber tqCorrectionStartBlkno;
+	BlockNumber tqBm25MetaStartBlkno;
 	HnswMetaPageData metaSnapshot;
 	int16		entryLevel;
 	uint16		metaPageKind;
@@ -812,6 +887,8 @@ tq_index_stats(PG_FUNCTION_ARGS)
 	int64		tqDeadNodeCount = 0;
 	int64		graphAdjacencyRefCount = 0;
 	int64		graphDeadNeighborRefCount = 0;
+	bool		hasBm25Meta = false;
+	TqHybridBm25MetaTupleData bm25Meta;
 	StringInfoData json;
 
 	index = index_open(indexOid, AccessShareLock);
@@ -838,6 +915,8 @@ tq_index_stats(PG_FUNCTION_ARGS)
 	tqFlags = metap->tqFlags;
 	tqBits = metap->tqBits != 0 ? metap->tqBits : TQ_DEFAULT_BITS;
 	tqCorrectionStartBlkno = metap->tqCorrectionStartBlkno;
+	tqBm25MetaStartBlkno = metap->tqBm25MetaStartBlkno > HNSW_METAPAGE_BLKNO ?
+		metap->tqBm25MetaStartBlkno : InvalidBlockNumber;
 	entryLevel = metap->entryLevel;
 	metaPageKind = opaque->pageKind & HNSW_PAGE_KIND_MASK;
 	metaLastGraphOp = opaque->pageKind >> HNSW_PAGE_GRAPH_OP_SHIFT;
@@ -856,6 +935,62 @@ tq_index_stats(PG_FUNCTION_ARGS)
 			firstGraphLastGraphOp = opaque->pageKind >> HNSW_PAGE_GRAPH_OP_SHIFT;
 		}
 		UnlockReleaseBuffer(buf);
+	}
+
+	if (BlockNumberIsValid(tqBm25MetaStartBlkno))
+	{
+		bool		foundBm25Tuple = false;
+
+		if (tqBm25MetaStartBlkno >= nblocks)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid BM25 metadata pointer is invalid"),
+					 errdetail("Metapage points to block %u, but the index has only %u blocks.",
+							   tqBm25MetaStartBlkno, nblocks)));
+
+		buf = ReadBuffer(index, tqBm25MetaStartBlkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		opaque = HnswPageGetOpaque(page);
+
+		if (opaque->page_id != HNSW_PAGE_ID ||
+			(opaque->pageKind & HNSW_PAGE_KIND_MASK) != HNSW_PAGE_KIND_TQ_BM25_META)
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid BM25 metadata pointer is invalid"),
+					 errdetail("Metapage points to block %u, which is not a BM25 metadata page.",
+							   tqBm25MetaStartBlkno)));
+		}
+
+		for (OffsetNumber off = FirstOffsetNumber;
+			 off <= PageGetMaxOffsetNumber(page);
+			 off = OffsetNumberNext(off))
+		{
+			ItemId		iid = PageGetItemId(page, off);
+			TqHybridBm25MetaTuple tuple;
+
+			if (!ItemIdIsUsed(iid))
+				continue;
+
+			tuple = (TqHybridBm25MetaTuple) PageGetItem(page, iid);
+			if (tuple->type == TQHYBRID_BM25_META_TUPLE_TYPE)
+			{
+				bm25Meta = *tuple;
+				hasBm25Meta = true;
+				foundBm25Tuple = true;
+				break;
+			}
+		}
+
+		UnlockReleaseBuffer(buf);
+		if (!foundBm25Tuple)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid BM25 metadata tuple is missing"),
+					 errdetail("Metapage points to BM25 metadata block %u, but no metadata tuple was found.",
+							   tqBm25MetaStartBlkno)));
 	}
 
 	for (BlockNumber blkno = HNSW_METAPAGE_BLKNO; blkno < nblocks; blkno++)
@@ -915,6 +1050,18 @@ tq_index_stats(PG_FUNCTION_ARGS)
 					 "\"tq_dead_node_count\":" INT64_FORMAT ","
 					 "\"graph_adjacency_ref_count\":" INT64_FORMAT ","
 					 "\"graph_dead_neighbor_refs\":" INT64_FORMAT ","
+					 "\"hybrid\":%s,"
+					 "\"bm25_meta_start_block\":%u,"
+					 "\"bm25_doc_count\":%u,"
+					 "\"bm25_live_doc_count\":" INT64_FORMAT ","
+					 "\"bm25_dead_doc_count\":" INT64_FORMAT ","
+					 "\"bm25_avgdl\":%.6g,"
+					 "\"bm25_term_count\":%u,"
+					 "\"bm25_postings_pages\":%u,"
+					 "\"bm25_blockmax_pages\":%u,"
+					 "\"bm25_delta_pages\":%u,"
+					 "\"bm25_delta_generation\":" UINT64_FORMAT ","
+					 "\"bm25_last_compaction\":\"%s\","
 					 "\"graph_page_last_op_counts\":{"
 					 "\"none\":" INT64_FORMAT ","
 					 "\"page_init\":" INT64_FORMAT ","
@@ -954,6 +1101,29 @@ tq_index_stats(PG_FUNCTION_ARGS)
 					 tqDeadNodeCount,
 					 graphAdjacencyRefCount,
 					 graphDeadNeighborRefCount,
+					 hasBm25Meta ? "true" : "false",
+					 tqBm25MetaStartBlkno,
+					 hasBm25Meta ? bm25Meta.docCount + bm25Meta.deltaDocCount : 0,
+					 hasBm25Meta ? (bm25Meta.lastCompactionGeneration > 0 &&
+									bm25Meta.deltaDocCount == 0 ?
+									(int64) bm25Meta.docCount :
+									Max((int64) (bm25Meta.docCount + bm25Meta.deltaDocCount) -
+										Min((int64) (bm25Meta.docCount + bm25Meta.deltaDocCount),
+											tqDeadNodeCount), 0)) : 0,
+					 hasBm25Meta ? (bm25Meta.lastCompactionGeneration > 0 &&
+									bm25Meta.deltaDocCount == 0 ? 0 :
+									Min((int64) (bm25Meta.docCount + bm25Meta.deltaDocCount),
+										tqDeadNodeCount)) : 0,
+					 hasBm25Meta ? (double) (bm25Meta.totalDocLen + bm25Meta.deltaTotalDocLen) /
+					 Max((double) (bm25Meta.docCount + bm25Meta.deltaDocCount), 1.0) : 0.0,
+					 hasBm25Meta ? bm25Meta.termCount : 0,
+					 hasBm25Meta ? bm25Meta.postingsPages : 0,
+					 hasBm25Meta ? bm25Meta.blockMaxPages : 0,
+					 hasBm25Meta ? bm25Meta.deltaPages : 0,
+					 hasBm25Meta ? bm25Meta.deltaGeneration : 0,
+					 hasBm25Meta && bm25Meta.lastCompactionGeneration > 0 ?
+					 psprintf("generation " UINT64_FORMAT,
+							  bm25Meta.lastCompactionGeneration) : "never",
 					 graphLastOpCounts[HNSW_GRAPH_OP_NONE],
 					 graphLastOpCounts[HNSW_GRAPH_OP_PAGE_INIT],
 					 graphLastOpCounts[HNSW_GRAPH_OP_PAGE_LINK],

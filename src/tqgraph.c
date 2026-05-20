@@ -1208,6 +1208,7 @@ TqGraphCreateMetaPage(Relation index, ForkNumber forkNum)
 	metap->tqAdjStartBlkno = InvalidBlockNumber;
 	metap->tqExactStartBlkno = InvalidBlockNumber;
 	metap->tqCorrectionStartBlkno = InvalidBlockNumber;
+	metap->tqBm25MetaStartBlkno = InvalidBlockNumber;
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
@@ -1976,6 +1977,8 @@ TqGraphReadMeta(Relation index, HnswMetaPageData *meta)
 	memcpy(meta, metap, sizeof(HnswMetaPageData));
 	if (meta->tqBits != 1 && meta->tqBits != 2 && meta->tqBits != TQ_DEFAULT_BITS)
 		meta->tqBits = TQ_DEFAULT_BITS;
+	if (meta->tqBm25MetaStartBlkno <= HNSW_METAPAGE_BLKNO)
+		meta->tqBm25MetaStartBlkno = InvalidBlockNumber;
 	UnlockReleaseBuffer(buf);
 	return true;
 }
@@ -2754,7 +2757,8 @@ TqGraphExactRescore(Relation index, HnswScanOpaque so, Datum query,
 
 
 static void
-TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so)
+TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so,
+					  int minResultTarget)
 {
 	HnswMetaPageData meta;
 	instr_time	totalStart;
@@ -2836,6 +2840,11 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so)
 	}
 	else
 		resultTarget = effectiveEf;
+
+	if (minResultTarget > 0)
+		resultTarget = (int) Min((int64) INT_MAX,
+								 Max((int64) resultTarget,
+									 (int64) minResultTarget));
 
 	if (so->graphRescoreBand == TQ_GRAPH_RESCORE_BAND_AUTO &&
 		(TqScoreMode) so->tq.scoreMode == TQ_SCORE_L2)
@@ -2979,6 +2988,73 @@ TqGraphCollectResults(IndexScanDesc scan, HnswScanOpaque so)
 	HnswRecordGraphScanStats(so);
 }
 
+int
+TqGraphCollectDenseCandidates(IndexScanDesc scan, int targetK,
+							  TqDenseCandidate **outCandidates,
+							  MemoryContext resultCtx,
+							  TqDenseCandidateStats *stats)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	TqGraphResult *results;
+	TqDenseCandidate *candidates;
+	int			count;
+	int			limit;
+	MemoryContext oldCtx;
+
+	if (so == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("turboquant dense candidate collection requires an active scan")));
+
+	if (so->tqGraphResults == NULL)
+	{
+		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		PG_TRY();
+		{
+			TqGraphCollectResults(scan, so, targetK);
+		}
+		PG_CATCH();
+		{
+			UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+	}
+
+	results = (TqGraphResult *) so->tqGraphResults;
+	count = so->tqGraphResultCount;
+	limit = targetK > 0 ? Min(targetK, count) : count;
+
+	oldCtx = MemoryContextSwitchTo(resultCtx);
+	candidates = palloc0(sizeof(TqDenseCandidate) * Max(limit, 1));
+	for (int i = 0; i < limit; i++)
+	{
+		candidates[i].nodeId = results[i].nodeId;
+		candidates[i].heaptid = results[i].heaptid;
+		candidates[i].distance = results[i].distance;
+		candidates[i].similarity = -results[i].distance;
+		candidates[i].rank = i + 1;
+		candidates[i].exactScored = results[i].exactScored;
+	}
+	MemoryContextSwitchTo(oldCtx);
+
+	if (stats != NULL)
+	{
+		memset(stats, 0, sizeof(*stats));
+		stats->visitedGraphNodes = so->graphVisitedNodes;
+		stats->scoredCodes = so->graphScoredCodes;
+		stats->denseCandidatesRequested = targetK > 0 ? targetK : limit;
+		stats->denseCandidatesReturned = limit;
+		stats->exactRescoreCount = so->graphRescoreCount;
+		stats->codePagesRead = so->graphCodePagesRead;
+		stats->adjPagesRead = so->graphAdjPagesRead;
+	}
+
+	*outCandidates = candidates;
+	return limit;
+}
+
 bool
 tqgraphgettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -2999,7 +3075,7 @@ tqgraphgettuple(IndexScanDesc scan, ScanDirection dir)
 			elog(ERROR, "non-MVCC snapshots are not supported with turboquant graph");
 
 		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
-		TqGraphCollectResults(scan, so);
+		TqGraphCollectResults(scan, so, 0);
 		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 		so->first = false;
 	}

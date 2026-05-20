@@ -1,0 +1,82 @@
+{
+  "bm25_k": 400,
+  "commit": "af2802ef029b0ebc0c23477ef8aa3d8eb0188b38",
+  "database": "contrib_regression",
+  "dataset_name": "fiqa-openai",
+  "dataset_path": ".cache/beir/fiqa",
+  "dense_k": 400,
+  "dimensions": 1536,
+  "final_k": 10,
+  "generated_at_unix": 1779285396,
+  "layer": "ir_quality_and_systems",
+  "postgres_version": "16.13 (Homebrew)",
+  "queries": 648,
+  "results": [
+    {
+      "build_ms": 176607.923,
+      "build_wal_bytes": 389141280,
+      "index_bytes": 491298816,
+      "latency": {
+        "mean_ms": 29.91,
+        "p50_ms": 23.364,
+        "p95_ms": 60.289,
+        "p99_ms": 81.79,
+        "qps": 33.434,
+        "runs": 648
+      },
+      "method": "postgres_sql_rrf",
+      "metrics": {
+        "map@10": 0.339807,
+        "mrr@10": 0.481562,
+        "ndcg@10": 0.41754,
+        "recall@10": 0.497579
+      }
+    },
+    {
+      "build_ms": 212029.072,
+      "build_wal_bytes": 422277672,
+      "index_bytes": 440754176,
+      "latency": {
+        "mean_ms": 15.179,
+        "p50_ms": 13.22,
+        "p95_ms": 30.169,
+        "p99_ms": 38.612,
+        "qps": 65.883,
+        "runs": 648
+      },
+      "method": "turbohybrid",
+      "metrics": {
+        "map@10": 0.342804,
+        "mrr@10": 0.486738,
+        "ndcg@10": 0.419723,
+        "recall@10": 0.49705
+      }
+    },
+    {
+      "build_ms": 70200.796,
+      "build_wal_bytes": 67811928,
+      "index_bytes": 83894272,
+      "latency": {
+        "mean_ms": 5.85,
+        "p50_ms": 4.868,
+        "p95_ms": 12.655,
+        "p99_ms": 15.804,
+        "qps": 170.949,
+        "runs": 648
+      },
+      "method": "turbohybrid_exact_storage_off",
+      "metrics": {
+        "map@10": 0.343457,
+        "mrr@10": 0.487622,
+        "ndcg@10": 0.419068,
+        "recall@10": 0.493158
+      }
+    }
+  ],
+  "rows": 57638,
+  "rrf_k": 60,
+  "runs": 1,
+  "split": "test",
+  "suite": "turbohybrid_real_rag",
+  "warmup": 1
+}

@@ -56,6 +56,7 @@ TqGraphInitScanStorageUncached(HnswMetaPageData *meta, TqGraphScanStorage *stora
 							   bool cacheExactVectors)
 {
 	memset(storage, 0, sizeof(TqGraphScanStorage));
+	storage->ctx = CurrentMemoryContext;
 	storage->nodes = palloc0(sizeof(TqGraphScanNode) * meta->tqNodeCount);
 	if (meta->tqNodeCount > 0 && meta->tqCodeBytes > 0)
 		storage->codeArena = palloc0((Size) meta->tqNodeCount * meta->tqCodeBytes);
@@ -81,6 +82,13 @@ TqGraphInitScanStorageUncached(HnswMetaPageData *meta, TqGraphScanStorage *stora
 		storage->adjPagesLoaded = palloc0(sizeof(bool) * storage->adjPageCount);
 	storage->codeBlknos = palloc(sizeof(BlockNumber) * storage->codePageCount);
 	TqGraphInitBlockMap(storage->codeBlknos, storage->codePageCount);
+	storage->adjBlknos = palloc(sizeof(BlockNumber) * TqGraphAdjRecordCount(meta));
+	storage->adjOffnos = palloc(sizeof(OffsetNumber) * TqGraphAdjRecordCount(meta));
+	for (int i = 0; i < TqGraphAdjRecordCount(meta); i++)
+	{
+		storage->adjBlknos[i] = InvalidBlockNumber;
+		storage->adjOffnos[i] = InvalidOffsetNumber;
+	}
 }
 
 bool
@@ -237,6 +245,8 @@ TqGraphLoadAllAdjPages(Relation index, HnswScanOpaque so, HnswMetaPageData *meta
 				continue;
 
 			tupleSlot = TqGraphAdjSlot(meta, tuple->nodeId, tuple->level);
+			storage->adjBlknos[tupleSlot] = blkno;
+			storage->adjOffnos[tupleSlot] = offno;
 			storage->neighborCounts[tupleSlot] = tuple->count;
 			if (storage->neighbors[tupleSlot] != NULL)
 			{
@@ -245,7 +255,8 @@ TqGraphLoadAllAdjPages(Relation index, HnswScanOpaque so, HnswMetaPageData *meta
 			}
 			if (tuple->count > 0)
 			{
-				storage->neighbors[tupleSlot] = palloc(sizeof(uint32) * tuple->count);
+				storage->neighbors[tupleSlot] =
+					MemoryContextAlloc(storage->ctx, sizeof(uint32) * tuple->count);
 				memcpy(storage->neighbors[tupleSlot], tuple->neighbors, sizeof(uint32) * tuple->count);
 			}
 		}
@@ -516,6 +527,7 @@ TqGraphBuildCache(Relation index, HnswMetaPageData *meta)
 
 	TqGraphInitScanStorageUncached(meta, &cache->storage,
 								   TqGraphShouldCacheExactVectors(index, meta));
+	cache->storage.ctx = cacheCtx;
 	if (meta->tqNodeCount > 0)
 	{
 		cache->storage.visitedGeneration = palloc0(sizeof(uint32) * meta->tqNodeCount);
@@ -554,4 +566,221 @@ TqGraphInitScanStorage(Relation index, HnswMetaPageData *meta,
 
 	memcpy(storage, &cache->storage, sizeof(TqGraphScanStorage));
 	storage->cached = true;
+}
+
+TqGraphNativeCache *
+TqGraphInitInsertStorage(Relation index, HnswMetaPageData *meta,
+						 TqGraphScanStorage *storage)
+{
+	TqGraphNativeCache *cache;
+
+	cache = TqGraphFindCache(index, meta);
+	if (cache == NULL)
+		cache = TqGraphBuildCache(index, meta);
+
+	memcpy(storage, &cache->storage, sizeof(TqGraphScanStorage));
+	storage->cached = true;
+	return cache;
+}
+
+static uint32 *
+TqGraphCacheCopyNeighbors(TqGraphScanStorage *storage, uint32 *neighbors,
+						  int count)
+{
+	uint32	   *copy;
+
+	if (count <= 0)
+		return NULL;
+
+	copy = MemoryContextAlloc(storage->ctx, sizeof(uint32) * count);
+	memcpy(copy, neighbors, sizeof(uint32) * count);
+	return copy;
+}
+
+void
+TqGraphAppendInsertCacheNode(TqGraphNativeCache *cache, HnswMetaPageData *meta,
+							 uint32 nodeId, ItemPointer heapTid,
+							 int nodeLevel, Vector *vector, uint8 *code,
+							 float scale, float norm, float codeNorm,
+							 float ecCorrection, int32 *payloads,
+							 uint16 payloadMask, BlockNumber exactBlkno,
+							 OffsetNumber exactOffno, uint32 **selected,
+							 int *selectedCounts, BlockNumber *adjBlknos,
+							 OffsetNumber *adjOffnos, BlockNumber codeStart,
+							 BlockNumber adjStart, BlockNumber exactStart,
+							 uint32 entryNodeId, uint16 graphMaxLevel)
+{
+	TqGraphScanStorage *storage;
+	uint32		oldNodeCount;
+	uint32		newNodeCount;
+	int			oldAdjRecordCount;
+	int			newAdjRecordCount;
+	int			oldCodePageCount;
+	int			newCodePageCount;
+	Size		codeBytes;
+	Size		payloadBytes;
+	MemoryContext oldCtx;
+
+	if (cache == NULL || nodeId != cache->tqNodeCount)
+		return;
+
+	storage = &cache->storage;
+	oldNodeCount = cache->tqNodeCount;
+	newNodeCount = oldNodeCount + 1;
+	oldAdjRecordCount = oldNodeCount * TqGraphLevelCapacity(meta->m);
+	newAdjRecordCount = newNodeCount * TqGraphLevelCapacity(meta->m);
+	oldCodePageCount = storage->codePageCount;
+	newCodePageCount = TqGraphPageCount(newNodeCount, storage->codeTuplesPerPage);
+	codeBytes = meta->tqCodeBytes;
+	payloadBytes = meta->tqPayloadBytes;
+
+	oldCtx = MemoryContextSwitchTo(cache->ctx);
+
+	storage->nodes = repalloc(storage->nodes,
+							  sizeof(TqGraphScanNode) * newNodeCount);
+	memset(&storage->nodes[nodeId], 0, sizeof(TqGraphScanNode));
+	if (codeBytes > 0)
+	{
+		storage->codeArena = repalloc(storage->codeArena,
+									  (Size) newNodeCount * codeBytes);
+		memcpy(storage->codeArena + ((Size) nodeId * codeBytes),
+			   code, codeBytes);
+	}
+	if (payloadBytes > 0)
+	{
+		storage->payloadArena = repalloc(storage->payloadArena,
+										 (Size) newNodeCount * payloadBytes);
+		if (payloads != NULL)
+			memcpy(storage->payloadArena + ((Size) nodeId * payloadBytes),
+				   payloads, payloadBytes);
+		else
+			memset(storage->payloadArena + ((Size) nodeId * payloadBytes),
+				   0, payloadBytes);
+	}
+	if (storage->exactArena != NULL)
+	{
+		storage->exactArena = repalloc(storage->exactArena,
+									   (Size) newNodeCount * storage->exactBytes);
+		memcpy(storage->exactArena + ((Size) nodeId * storage->exactBytes),
+			   vector, storage->exactBytes);
+	}
+	if (storage->visitedGeneration != NULL)
+	{
+		storage->visitedGeneration = repalloc(storage->visitedGeneration,
+											  sizeof(uint32) * newNodeCount);
+		storage->visitedGeneration[nodeId] = 0;
+	}
+	if (newCodePageCount != oldCodePageCount)
+	{
+		storage->codePagesLoaded = repalloc(storage->codePagesLoaded,
+											sizeof(bool) * newCodePageCount);
+		storage->codeBlknos = repalloc(storage->codeBlknos,
+									   sizeof(BlockNumber) * newCodePageCount);
+		for (int i = oldCodePageCount; i < newCodePageCount; i++)
+		{
+			storage->codePagesLoaded[i] = true;
+			storage->codeBlknos[i] = InvalidBlockNumber;
+		}
+		storage->codePageCount = newCodePageCount;
+	}
+
+	storage->neighbors = repalloc(storage->neighbors,
+								  sizeof(uint32 *) * newAdjRecordCount);
+	storage->neighborCounts = repalloc(storage->neighborCounts,
+									   sizeof(uint16) * newAdjRecordCount);
+	storage->adjBlknos = repalloc(storage->adjBlknos,
+								  sizeof(BlockNumber) * newAdjRecordCount);
+	storage->adjOffnos = repalloc(storage->adjOffnos,
+								  sizeof(OffsetNumber) * newAdjRecordCount);
+	memset(&storage->neighbors[oldAdjRecordCount], 0,
+		   sizeof(uint32 *) * (newAdjRecordCount - oldAdjRecordCount));
+	memset(&storage->neighborCounts[oldAdjRecordCount], 0,
+		   sizeof(uint16) * (newAdjRecordCount - oldAdjRecordCount));
+	for (int i = oldAdjRecordCount; i < newAdjRecordCount; i++)
+	{
+		storage->adjBlknos[i] = InvalidBlockNumber;
+		storage->adjOffnos[i] = InvalidOffsetNumber;
+	}
+
+	for (int level = 0; level < TqGraphLevelCapacity(meta->m); level++)
+	{
+		int			slot = TqGraphAdjSlot(meta, nodeId, level);
+		int			count = level <= nodeLevel ? selectedCounts[level] : 0;
+
+		storage->neighborCounts[slot] = count;
+		if (level <= nodeLevel)
+		{
+			storage->adjBlknos[slot] = adjBlknos[level];
+			storage->adjOffnos[slot] = adjOffnos[level];
+		}
+		storage->neighbors[slot] =
+			TqGraphCacheCopyNeighbors(storage,
+									  level <= nodeLevel ? selected[level] : NULL,
+									  count);
+	}
+
+	storage->nodes[nodeId].heaptid = *heapTid;
+	storage->nodes[nodeId].level = nodeLevel;
+	storage->nodes[nodeId].exactBlkno = exactBlkno;
+	storage->nodes[nodeId].exactOffno = exactOffno;
+	storage->nodes[nodeId].payloadMask = payloadMask;
+	storage->nodes[nodeId].scale = scale;
+	storage->nodes[nodeId].norm = norm;
+	storage->nodes[nodeId].codeNorm = codeNorm;
+	storage->nodes[nodeId].ecCorrection = ecCorrection;
+	storage->nodes[nodeId].flags = 0;
+	storage->nodes[nodeId].loaded = true;
+	if (codeBytes > 0)
+		storage->nodes[nodeId].code = storage->codeArena + ((Size) nodeId * codeBytes);
+	if (payloadBytes > 0)
+		storage->nodes[nodeId].payloads =
+			(int32 *) (storage->payloadArena + ((Size) nodeId * payloadBytes));
+	if (storage->exactArena != NULL)
+		storage->nodes[nodeId].exactVector =
+			storage->exactArena + ((Size) nodeId * storage->exactBytes);
+
+	if (payloadBytes > 0 && payloads != NULL && payloadMask != 0)
+	{
+		uint32		addedRefs = 0;
+
+		for (int slot = 0; slot < meta->tqPayloadCount; slot++)
+		{
+			if (payloadMask & (uint16) (1U << slot))
+				addedRefs++;
+		}
+		if (addedRefs > 0)
+		{
+			uint32		oldRefCount = storage->payloadRefCount;
+			uint32		refIndex = oldRefCount;
+
+			if (storage->payloadRefs == NULL)
+				storage->payloadRefs =
+					palloc(sizeof(TqGraphPayloadRef) * addedRefs);
+			else
+				storage->payloadRefs = repalloc(storage->payloadRefs,
+												sizeof(TqGraphPayloadRef) *
+												(oldRefCount + addedRefs));
+			for (int slot = 0; slot < meta->tqPayloadCount; slot++)
+			{
+				if ((payloadMask & (uint16) (1U << slot)) == 0)
+					continue;
+				storage->payloadRefs[refIndex].payloadSlot = (int16) slot;
+				storage->payloadRefs[refIndex].payloadValue = payloads[slot];
+				storage->payloadRefs[refIndex].nodeId = nodeId;
+				refIndex++;
+			}
+			storage->payloadRefCount = oldRefCount + addedRefs;
+			qsort(storage->payloadRefs, storage->payloadRefCount,
+				  sizeof(TqGraphPayloadRef), TqGraphPayloadRefCompare);
+		}
+	}
+
+	cache->tqNodeCount = newNodeCount;
+	cache->tqEntryNodeId = entryNodeId;
+	cache->graphMaxLevel = graphMaxLevel;
+	cache->tqCodeStartBlkno = codeStart;
+	cache->tqAdjStartBlkno = adjStart;
+	cache->tqExactStartBlkno = exactStart;
+
+	MemoryContextSwitchTo(oldCtx);
 }

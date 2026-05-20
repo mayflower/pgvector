@@ -9,6 +9,11 @@
 
 #include "tqgraph.h"
 
+static Oid	tqGraphExactAppendRelid = InvalidOid;
+static Oid	tqGraphExactAppendRelfilenumber = InvalidOid;
+static BlockNumber tqGraphExactAppendStart = InvalidBlockNumber;
+static BlockNumber tqGraphExactAppendTail = InvalidBlockNumber;
+
 static TqGraphExactSlabPageHeader
 TqGraphExactSlabHeader(Page page)
 {
@@ -255,11 +260,17 @@ TqGraphAppendInsertedExact(Relation index, BlockNumber *exactStart,
 	char	   *src = (char *) vector;
 	Size		remaining = VECTOR_SIZE(dimensions);
 	BlockNumber blkno = *exactStart;
+	BlockNumber originalStart = *exactStart;
 
 	(void) nodeId;
 
 	*exactBlkno = InvalidBlockNumber;
 	*exactOffno = InvalidOffsetNumber;
+	if (tqGraphExactAppendRelid == RelationGetRelid(index) &&
+		tqGraphExactAppendRelfilenumber == TqGraphRelFileNumber(index) &&
+		tqGraphExactAppendStart == originalStart &&
+		BlockNumberIsValid(tqGraphExactAppendTail))
+		blkno = tqGraphExactAppendTail;
 
 	while (remaining > 0)
 	{
@@ -397,4 +408,9 @@ TqGraphAppendInsertedExact(Relation index, BlockNumber *exactStart,
 		HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno,
 							   HNSW_GRAPH_OP_ELEMENT_INSERT);
 	}
+
+	tqGraphExactAppendRelid = RelationGetRelid(index);
+	tqGraphExactAppendRelfilenumber = TqGraphRelFileNumber(index);
+	tqGraphExactAppendStart = *exactStart;
+	tqGraphExactAppendTail = blkno;
 }

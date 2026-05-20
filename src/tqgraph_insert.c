@@ -9,10 +9,27 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "tqgraph.h"
 #include "tqgraph_score.h"
+
+typedef struct TqGraphInsertAppendCursor
+{
+	Oid			relid;
+	Oid			relfilenumber;
+	BlockNumber startBlkno;
+	BlockNumber tailBlkno;
+	uint16		pageKind;
+} TqGraphInsertAppendCursor;
+
+static TqGraphInsertAppendCursor tqGraphCodeAppendCursor = {
+	InvalidOid, InvalidOid, InvalidBlockNumber, InvalidBlockNumber, 0
+};
+static TqGraphInsertAppendCursor tqGraphAdjAppendCursor = {
+	InvalidOid, InvalidOid, InvalidBlockNumber, InvalidBlockNumber, 0
+};
 
 static int
 TqGraphInsertResultCompare(const void *a, const void *b)
@@ -180,12 +197,14 @@ TqGraphLoadAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 }
 
 static void
-TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
+TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta,
+					  TqGraphScanStorage *storage, uint32 nodeId,
 					  int level, uint32 *neighbors, int count)
 {
 	BlockNumber blkno = meta->tqAdjStartBlkno;
 	BlockNumber nblocks;
 	bool		found = false;
+	int			cacheSlot = -1;
 
 	if (nodeId >= meta->tqNodeCount || level < 0 ||
 		level >= TqGraphLevelCapacity(meta->m) ||
@@ -194,6 +213,81 @@ TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 
 	if (!BlockNumberIsValid(blkno))
 		elog(ERROR, "missing turboquant graph adjacency page");
+
+	if (storage != NULL && storage->cached)
+	{
+		cacheSlot = TqGraphAdjSlot(meta, nodeId, level);
+		if (cacheSlot >= 0 && cacheSlot < TqGraphAdjRecordCount(meta) &&
+			BlockNumberIsValid(storage->adjBlknos[cacheSlot]) &&
+			OffsetNumberIsValid(storage->adjOffnos[cacheSlot]))
+		{
+			Buffer		buf;
+			Page		page;
+			HnswPageOpaque opaque;
+			GenericXLogState *xlogState = NULL;
+
+			blkno = storage->adjBlknos[cacheSlot];
+			buf = ReadBuffer(index, blkno);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			if (RelationNeedsWAL(index))
+			{
+				xlogState = GenericXLogStart(index);
+				page = GenericXLogRegisterBuffer(xlogState, buf, 0);
+			}
+			else
+				page = BufferGetPage(buf);
+
+			opaque = HnswPageGetOpaque(page);
+			if ((opaque->pageKind & HNSW_PAGE_KIND_MASK) == HNSW_PAGE_KIND_TQ_ADJ &&
+				storage->adjOffnos[cacheSlot] <= PageGetMaxOffsetNumber(page))
+			{
+				ItemId		iid = PageGetItemId(page, storage->adjOffnos[cacheSlot]);
+				TqGraphAdjTuple tuple;
+				Size		tupleSize;
+				int			tupleCapacity;
+
+				if (ItemIdIsUsed(iid))
+				{
+					tuple = (TqGraphAdjTuple) PageGetItem(page, iid);
+					tupleSize = ItemIdGetLength(iid);
+					tupleCapacity = (tupleSize - offsetof(TqGraphAdjTupleData, neighbors)) /
+						sizeof(uint32);
+					if (tuple->type == TQ_GRAPH_ADJ_TUPLE_TYPE &&
+						tuple->nodeId == nodeId &&
+						tuple->level == level &&
+						count <= tupleCapacity)
+					{
+						tuple->count = count;
+						memcpy(tuple->neighbors, neighbors,
+							   sizeof(uint32) * count);
+						if (count < tupleCapacity)
+							memset(&tuple->neighbors[count], 0,
+								   sizeof(uint32) * (tupleCapacity - count));
+						HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
+						found = true;
+					}
+				}
+			}
+
+			if (xlogState != NULL)
+			{
+				if (found)
+					GenericXLogFinish(xlogState);
+				else
+					GenericXLogAbort(xlogState);
+			}
+			else if (found)
+				MarkBufferDirty(buf);
+			UnlockReleaseBuffer(buf);
+
+			if (found)
+				HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno,
+									  HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
+		}
+	}
+
+	if (found)
+		goto update_cache;
 
 	nblocks = RelationGetNumberOfBlocks(index);
 	while (BlockNumberIsValid(blkno) && blkno < nblocks)
@@ -257,6 +351,11 @@ TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 				memset(&tuple->neighbors[count], 0,
 					   sizeof(uint32) * (tupleCapacity - count));
 			HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_NEIGHBOR_UPDATE);
+			if (storage != NULL && storage->cached && cacheSlot >= 0)
+			{
+				storage->adjBlknos[cacheSlot] = blkno;
+				storage->adjOffnos[cacheSlot] = offno;
+			}
 			found = true;
 			break;
 		}
@@ -285,6 +384,29 @@ TqGraphUpdateAdjTuple(Relation index, HnswMetaPageData *meta, uint32 nodeId,
 
 	if (!found)
 		elog(ERROR, "missing turboquant graph adjacency tuple");
+
+update_cache:
+	if (storage != NULL && storage->cached)
+	{
+		int			slot = cacheSlot >= 0 ? cacheSlot :
+			TqGraphAdjSlot(meta, nodeId, level);
+
+		if (slot >= 0 && slot < TqGraphAdjRecordCount(meta))
+		{
+			if (storage->neighbors[slot] != NULL)
+				pfree(storage->neighbors[slot]);
+			storage->neighborCounts[slot] = count;
+			if (count > 0)
+			{
+				storage->neighbors[slot] =
+					MemoryContextAlloc(storage->ctx, sizeof(uint32) * count);
+				memcpy(storage->neighbors[slot], neighbors,
+					   sizeof(uint32) * count);
+			}
+			else
+				storage->neighbors[slot] = NULL;
+		}
+	}
 }
 
 static bool
@@ -409,7 +531,22 @@ TqGraphUpdateReciprocalNeighbor(Relation index, HnswMetaPageData *meta,
 
 	neighbors = palloc0(sizeof(uint32) * (maxNeighbors + 1));
 	pruned = palloc0(sizeof(uint32) * maxNeighbors);
-	if (!TqGraphLoadAdjTuple(index, meta, src, level, neighbors, &count))
+	if (storage->cached)
+	{
+		int			slot = TqGraphAdjSlot(meta, src, level);
+
+		if (slot < 0 || slot >= TqGraphAdjRecordCount(meta))
+		{
+			pfree(neighbors);
+			pfree(pruned);
+			return;
+		}
+		count = Min(storage->neighborCounts[slot], maxNeighbors);
+		if (count > 0 && storage->neighbors[slot] != NULL)
+			memcpy(neighbors, storage->neighbors[slot],
+				   sizeof(uint32) * count);
+	}
+	else if (!TqGraphLoadAdjTuple(index, meta, src, level, neighbors, &count))
 	{
 		pfree(neighbors);
 		pfree(pruned);
@@ -489,7 +626,7 @@ TqGraphUpdateReciprocalNeighbor(Relation index, HnswMetaPageData *meta,
 			pfree(sourceVector);
 	}
 
-	TqGraphUpdateAdjTuple(index, meta, src, level, neighbors, count);
+	TqGraphUpdateAdjTuple(index, meta, storage, src, level, neighbors, count);
 	pfree(neighbors);
 	pfree(pruned);
 }
@@ -515,6 +652,38 @@ TqGraphUpdateReciprocalNeighbors(Relation index, HnswMetaPageData *meta,
 	}
 }
 
+
+static OffsetNumber
+TqGraphAppendTupleWithCursor(Relation index, BlockNumber *startBlkno,
+							 uint16 pageKind, Item tuple, Size tupleSize,
+							 uint16 graphOpKind, BlockNumber *insertBlkno,
+							 TqGraphInsertAppendCursor *cursor)
+{
+	BlockNumber originalStart = *startBlkno;
+	BlockNumber appendStart = originalStart;
+	OffsetNumber offno;
+
+	if (cursor->relid == RelationGetRelid(index) &&
+		cursor->relfilenumber == TqGraphRelFileNumber(index) &&
+		cursor->pageKind == pageKind &&
+		cursor->startBlkno == originalStart &&
+		BlockNumberIsValid(cursor->tailBlkno))
+		appendStart = cursor->tailBlkno;
+
+	offno = TqGraphAppendTuple(index, MAIN_FORKNUM, &appendStart,
+							   pageKind, tuple, tupleSize, graphOpKind,
+							   insertBlkno);
+	if (!BlockNumberIsValid(originalStart))
+		*startBlkno = appendStart;
+
+	cursor->relid = RelationGetRelid(index);
+	cursor->relfilenumber = TqGraphRelFileNumber(index);
+	cursor->pageKind = pageKind;
+	cursor->startBlkno = *startBlkno;
+	cursor->tailBlkno = *insertBlkno;
+
+	return offno;
+}
 
 
 static void
@@ -548,17 +717,20 @@ TqGraphAppendInsertedCode(Relation index, BlockNumber *codeStart,
 	memcpy(TqGraphTupleCode(tuple, payloadBytes, tqWeighted), code,
 		   TqGraphCodeBytesForBits(vector->dim, bits));
 
-	(void) TqGraphAppendTuple(index, MAIN_FORKNUM, codeStart,
-							  HNSW_PAGE_KIND_TQ_CODE, (Item) tuple,
-							  tupleSize, HNSW_GRAPH_OP_ELEMENT_INSERT,
-							  &codeBlkno);
+	(void) TqGraphAppendTupleWithCursor(index, codeStart,
+										HNSW_PAGE_KIND_TQ_CODE,
+										(Item) tuple, tupleSize,
+										HNSW_GRAPH_OP_ELEMENT_INSERT,
+										&codeBlkno,
+										&tqGraphCodeAppendCursor);
 	pfree(tuple);
 }
 
 static void
 TqGraphAppendInsertedAdj(Relation index, BlockNumber *adjStart, int m,
 						 uint32 nodeId, int nodeLevel, uint32 **selected,
-						 int *selectedCounts)
+						 int *selectedCounts, BlockNumber *adjBlknos,
+						 OffsetNumber *adjOffnos)
 {
 	Size		maxTupleSize = TqGraphAdjTupleSize(TqGraphLevelM(m, 0));
 	TqGraphAdjTuple tuple = palloc0(maxTupleSize);
@@ -567,6 +739,7 @@ TqGraphAppendInsertedAdj(Relation index, BlockNumber *adjStart, int m,
 	for (int level = 0; level <= maxLevel; level++)
 	{
 		BlockNumber adjBlkno;
+		OffsetNumber adjOffno;
 		int			count = selectedCounts[level];
 		Size		tupleSize = TqGraphAdjTupleSize(TqGraphLevelM(m, level));
 
@@ -578,10 +751,16 @@ TqGraphAppendInsertedAdj(Relation index, BlockNumber *adjStart, int m,
 		for (int i = 0; i < count; i++)
 			tuple->neighbors[i] = selected[level][i];
 
-		(void) TqGraphAppendTuple(index, MAIN_FORKNUM, adjStart,
-								  HNSW_PAGE_KIND_TQ_ADJ, (Item) tuple,
-								  tupleSize, HNSW_GRAPH_OP_NEIGHBOR_INSERT,
-								  &adjBlkno);
+		adjOffno = TqGraphAppendTupleWithCursor(index, adjStart,
+												HNSW_PAGE_KIND_TQ_ADJ,
+												(Item) tuple, tupleSize,
+												HNSW_GRAPH_OP_NEIGHBOR_INSERT,
+												&adjBlkno,
+												&tqGraphAdjAppendCursor);
+		if (adjBlknos != NULL)
+			adjBlknos[level] = adjBlkno;
+		if (adjOffnos != NULL)
+			adjOffnos[level] = adjOffno;
 	}
 
 	pfree(tuple);
@@ -598,6 +777,7 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	HnswSupport support;
 	TqGraphBuildState metaState;
 	TqGraphBuildNode *metaNodes;
+	TqGraphNativeCache *insertCache = NULL;
 	Vector	   *vector = (Vector *) DatumGetPointer(value);
 	uint8	   *code;
 	float		scale;
@@ -606,6 +786,8 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	int			levelCapacity;
 	uint32	  **selected;
 	int		   *selectedCounts;
+	BlockNumber *adjBlknos;
+	OffsetNumber *adjOffnos;
 	BlockNumber codeStart;
 	BlockNumber adjStart;
 	BlockNumber exactStart;
@@ -687,8 +869,14 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	insertCodeNorm = TqGraphCodeNorm(code, vector->dim, meta.tqBits);
 	selected = palloc0(sizeof(uint32 *) * levelCapacity);
 	selectedCounts = palloc0(sizeof(int) * levelCapacity);
+	adjBlknos = palloc(sizeof(BlockNumber) * levelCapacity);
+	adjOffnos = palloc(sizeof(OffsetNumber) * levelCapacity);
 	for (int level = 0; level < levelCapacity; level++)
+	{
 		selected[level] = palloc0(sizeof(uint32) * TqGraphLevelM(meta.m, level));
+		adjBlknos[level] = InvalidBlockNumber;
+		adjOffnos[level] = InvalidOffsetNumber;
+	}
 
 	HnswInitSupport(&support, index);
 
@@ -708,7 +896,7 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 			TQ_GRAPH_RESCORE_BAND_EXACT : TQ_GRAPH_RESCORE_BAND_NONE;
 		HnswPrepareTqQuery(index, &support, query, &insertSo.tq);
 
-		TqGraphInitScanStorage(index, &meta, &storage);
+		insertCache = TqGraphInitInsertStorage(index, &meta, &storage);
 		resultTarget = Min(Max(meta.efConstruction, TqGraphLevelM(meta.m, 0)),
 						   (int) meta.tqNodeCount);
 		searchEf = resultTarget;
@@ -746,7 +934,7 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 							  payloadCount, meta.tqBits, exactBlkno, exactOffno,
 							  insertTqWeighted, insertXm);
 	TqGraphAppendInsertedAdj(index, &adjStart, meta.m, newNodeId, nodeLevel,
-							 selected, selectedCounts);
+							 selected, selectedCounts, adjBlknos, adjOffnos);
 
 	entryNodeId = meta.tqNodeCount == 0 || nodeLevel > meta.graphMaxLevel ?
 		newNodeId : meta.tqEntryNodeId;
@@ -775,13 +963,24 @@ TqGraphInsertValueInPlace(Relation index, IndexInfo *indexInfo,
 	metaState.nodes = metaNodes;
 	TqGraphUpdateMetaPage(index, &metaState, codeStart, adjStart, exactStart,
 						  meta.tqCorrectionStartBlkno);
-	TqGraphInvalidateCaches(index);
+	if (insertCache != NULL)
+		TqGraphAppendInsertCacheNode(insertCache, &meta, newNodeId, heap_tid,
+									 nodeLevel, vector, code, scale,
+									 insertNorm, insertCodeNorm, insertXm,
+									 payloads, payloadMask, exactBlkno,
+									 exactOffno, selected, selectedCounts,
+									 adjBlknos, adjOffnos,
+									 codeStart, adjStart, exactStart,
+									 entryNodeId,
+									 (uint16) Max(meta.graphMaxLevel, nodeLevel));
 	pfree(metaNodes);
 
 	for (int level = 0; level < levelCapacity; level++)
 		pfree(selected[level]);
 	pfree(selected);
 	pfree(selectedCounts);
+	pfree(adjBlknos);
+	pfree(adjOffnos);
 	if (payloads != NULL)
 		pfree(payloads);
 	if (ecShift != NULL)

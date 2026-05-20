@@ -190,6 +190,27 @@ typedef struct TqGraphResult
 	bool		exactScored;
 } TqGraphResult;
 
+typedef struct TqDenseCandidate
+{
+	uint32		nodeId;
+	ItemPointerData heaptid;
+	double		distance;
+	double		similarity;
+	int32		rank;
+	bool		exactScored;
+} TqDenseCandidate;
+
+typedef struct TqDenseCandidateStats
+{
+	uint32		denseCandidatesRequested;
+	uint64		visitedGraphNodes;
+	uint64		scoredCodes;
+	uint32		denseCandidatesReturned;
+	uint64		exactRescoreCount;
+	uint64		codePagesRead;
+	uint64		adjPagesRead;
+} TqDenseCandidateStats;
+
 typedef struct TqGraphScanNode
 {
 	ItemPointerData heaptid;
@@ -229,8 +250,11 @@ typedef struct TqGraphScanStorage
 	bool	   *codePagesLoaded;
 	bool	   *adjPagesLoaded;
 	BlockNumber *codeBlknos;
+	BlockNumber *adjBlknos;
+	OffsetNumber *adjOffnos;
 	TqGraphPayloadRef *payloadRefs;
 	uint32		payloadRefCount;
+	MemoryContext ctx;
 	int			codeTuplesPerPage;
 	int			codePageCount;
 	int			adjPageCount;
@@ -473,11 +497,35 @@ Vector	   *TqGraphReadExactVector(Relation index, TqGraphScanNode *node,
 BlockNumber TqGraphWriteExactPages(TqGraphBuildState *state);
 void		TqGraphInvalidateCaches(Relation index);
 void		TqGraphInitScanStorage(Relation index, HnswMetaPageData *meta,
-								   TqGraphScanStorage *storage);
+							   TqGraphScanStorage *storage);
+TqGraphNativeCache *TqGraphInitInsertStorage(Relation index, HnswMetaPageData *meta,
+										  TqGraphScanStorage *storage);
+void		TqGraphAppendInsertCacheNode(TqGraphNativeCache *cache,
+										 HnswMetaPageData *meta,
+										 uint32 nodeId, ItemPointer heapTid,
+										 int nodeLevel, Vector *vector,
+										 uint8 *code, float scale, float norm,
+										 float codeNorm, float ecCorrection,
+										 int32 *payloads, uint16 payloadMask,
+										 BlockNumber exactBlkno,
+										 OffsetNumber exactOffno,
+										 uint32 **selected,
+										 int *selectedCounts,
+										 BlockNumber *adjBlknos,
+										 OffsetNumber *adjOffnos,
+										 BlockNumber codeStart,
+										 BlockNumber adjStart,
+										 BlockNumber exactStart,
+										 uint32 entryNodeId,
+										 uint16 graphMaxLevel);
 int64		TqGraphGetActiveLimitTupleTarget(void);
 double		TqGraphGetActiveEstimatedFilterSelectivity(void);
 bool		TqGraphGetActivePayloadInt4Filter(AttrNumber *heap_attno, int32 *value);
 void		TqGraphSeedScanContext(HnswScanOpaque so, int64 tuple_target,
 							   double estimated_filter_selectivity);
+int			TqGraphCollectDenseCandidates(IndexScanDesc scan, int targetK,
+										  TqDenseCandidate **outCandidates,
+										  MemoryContext resultCtx,
+										  TqDenseCandidateStats *stats);
 
 #endif
