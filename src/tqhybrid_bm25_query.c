@@ -48,8 +48,6 @@ TqHybridBm25KernelName(int kernel)
 			return "neon";
 		case TQHYBRID_BM25_KERNEL_AVX2:
 			return "avx2";
-		case TQHYBRID_BM25_KERNEL_AVX512F:
-			return "avx512f";
 		case TQHYBRID_BM25_KERNEL_SCALAR:
 		default:
 			return "scalar";
@@ -376,12 +374,15 @@ typedef struct TqHybridBm25Cache
 	uint32		deltaTermCount;
 	uint32		deltaPostingCount;
 	uint64		deltaCacheBytes;
-	bool		cacheLimitWarned;
 	MemoryContext ctx;
 	struct TqHybridBm25Cache *next;
 } TqHybridBm25Cache;
 
 static TqHybridBm25Cache *tqhybrid_bm25_cache_list = NULL;
+
+static int TqHybridBm25FindQueryTerm(TqHybridBm25QueryTerm *terms,
+									 int termCount, const char *term,
+									 uint16 termLen);
 
 static uint64
 TqHybridBm25ElapsedUs(instr_time start)
@@ -1204,17 +1205,18 @@ TqHybridBm25CacheFindLexiconEntry(TqHybridBm25Cache *cache,
 }
 
 static TqHybridBm25DeltaCacheEntry *
-TqHybridBm25CacheFindDeltaEntry(TqHybridBm25Cache *cache,
-								TqHybridBm25QueryTerm *term)
+TqHybridBm25FindDeltaEntry(TqHybridBm25DeltaCacheEntry *deltaTerms,
+						   uint32 deltaTermCount,
+						   TqHybridBm25QueryTerm *term)
 {
 	uint64		termHash = TqHybridBm25HashTerm(term->term, term->termLen);
 	int			lo = 0;
-	int			hi = (int) cache->deltaTermCount - 1;
+	int			hi = (int) deltaTermCount - 1;
 
 	while (lo <= hi)
 	{
 		int			mid = lo + (hi - lo) / 2;
-		TqHybridBm25DeltaCacheEntry *candidate = &cache->deltaTerms[mid];
+		TqHybridBm25DeltaCacheEntry *candidate = &deltaTerms[mid];
 		int			cmp;
 
 		if (candidate->termHash != termHash)
@@ -1245,26 +1247,32 @@ TqHybridBm25DeltaBuildSameTerm(TqHybridBm25DeltaBuildEntry *left,
 }
 
 static void
-TqHybridBm25EnsureDeltaCache(Relation index,
-							 const TqHybridBm25MetaTupleData *meta,
-							 TqHybridBm25Cache *cache,
-							 TqHybridBm25QueryStats *stats)
+TqHybridBm25BuildDeltaCacheEntries(Relation index,
+								   const TqHybridBm25MetaTupleData *meta,
+								   TqHybridBm25Cache *cache,
+								   TqHybridBm25QueryTerm *filterTerms,
+								   int filterTermCount,
+								   MemoryContext memoryContext,
+								   TqHybridBm25DeltaCacheEntry **outTerms,
+								   uint32 *outTermCount,
+								   uint32 *outPostingCount,
+								   uint64 *outBytes,
+								   TqHybridBm25QueryStats *stats)
 {
 	MemoryContext oldCtx;
 	BlockNumber blkno = meta->deltaStartBlkno;
 	TqHybridBm25DeltaBuildEntry *buildEntries = NULL;
 	uint32		buildCount = 0;
-	uint32		buildCapacity = Max(meta->deltaTermCount, 1);
+	uint32		buildCapacity = filterTerms == NULL ?
+		Max(meta->deltaTermCount, 1) : Max((uint32) filterTermCount, 1);
 	uint64		blocksVisited = 0;
+	uint64		finalBytes = 0;
 
-	if (cache->deltaCacheBuilt)
-	{
-		if (stats != NULL)
-			stats->deltaCacheHit = true;
-		return;
-	}
-
-	oldCtx = MemoryContextSwitchTo(cache->ctx);
+	*outTerms = NULL;
+	*outTermCount = 0;
+	*outPostingCount = 0;
+	*outBytes = 0;
+	oldCtx = MemoryContextSwitchTo(memoryContext);
 	buildEntries = palloc0(sizeof(TqHybridBm25DeltaBuildEntry) *
 						   buildCapacity);
 
@@ -1313,6 +1321,11 @@ TqHybridBm25EnsureDeltaCache(Relation index,
 
 				if (term->termOffset + term->termLen > tuple->termBytesLen)
 					continue;
+				if (filterTerms != NULL &&
+					TqHybridBm25FindQueryTerm(filterTerms, filterTermCount,
+											  termBytes + term->termOffset,
+											  term->termLen) < 0)
+					continue;
 				if (buildCount >= buildCapacity)
 				{
 					buildCapacity *= 2;
@@ -1358,8 +1371,9 @@ TqHybridBm25EnsureDeltaCache(Relation index,
 			i = j;
 		}
 
-		cache->deltaTerms = palloc0(sizeof(TqHybridBm25DeltaCacheEntry) *
-									termCount);
+		*outTerms = palloc0(sizeof(TqHybridBm25DeltaCacheEntry) *
+							 termCount);
+		finalBytes += sizeof(TqHybridBm25DeltaCacheEntry) * termCount;
 		for (uint32 i = 0; i < buildCount;)
 		{
 			uint32		j = i + 1;
@@ -1370,17 +1384,20 @@ TqHybridBm25EnsureDeltaCache(Relation index,
 												  &buildEntries[j]))
 				j++;
 
-			termEntry = &cache->deltaTerms[outTerm++];
+			termEntry = &(*outTerms)[outTerm++];
 			termEntry->termLen = buildEntries[i].termLen;
 			termEntry->termHash = buildEntries[i].termHash;
 			termEntry->df = j - i;
 			termEntry->postingCount = j - i;
 			termEntry->termBytes = palloc(termEntry->termLen);
+			finalBytes += termEntry->termLen;
 			memcpy(termEntry->termBytes, buildEntries[i].termBytes,
 				   termEntry->termLen);
 			termEntry->postings =
 				palloc0(sizeof(TqHybridBm25DeltaCachePosting) *
 						termEntry->postingCount);
+			finalBytes += sizeof(TqHybridBm25DeltaCachePosting) *
+				termEntry->postingCount;
 			for (uint32 k = i; k < j; k++)
 			{
 				TqHybridBm25DeltaCachePosting *posting =
@@ -1392,17 +1409,16 @@ TqHybridBm25EnsureDeltaCache(Relation index,
 				posting->heaptid = buildEntries[k].heaptid;
 				pfree(buildEntries[k].termBytes);
 			}
-			cache->deltaPostingCount += termEntry->postingCount;
+			*outPostingCount += termEntry->postingCount;
 			i = j;
 		}
-		cache->deltaTermCount = outTerm;
-		qsort(cache->deltaTerms, cache->deltaTermCount,
+		*outTermCount = outTerm;
+		qsort(*outTerms, *outTermCount,
 			  sizeof(TqHybridBm25DeltaCacheEntry),
 			  TqHybridBm25DeltaCacheCompare);
 	}
 	pfree(buildEntries);
-	cache->deltaCacheBuilt = true;
-	cache->deltaCacheBytes = MemoryContextMemAllocated(cache->ctx, true);
+	*outBytes = finalBytes;
 
 	if (stats != NULL)
 	{
@@ -1410,6 +1426,28 @@ TqHybridBm25EnsureDeltaCache(Relation index,
 		stats->deltaBlocksVisited += blocksVisited;
 	}
 	MemoryContextSwitchTo(oldCtx);
+}
+
+static void
+TqHybridBm25EnsureDeltaCache(Relation index,
+							 const TqHybridBm25MetaTupleData *meta,
+							 TqHybridBm25Cache *cache,
+							 TqHybridBm25QueryStats *stats)
+{
+	if (cache->deltaCacheBuilt)
+	{
+		if (stats != NULL)
+			stats->deltaCacheHit = true;
+		return;
+	}
+
+	TqHybridBm25BuildDeltaCacheEntries(index, meta, cache, NULL, 0,
+									   cache->ctx, &cache->deltaTerms,
+									   &cache->deltaTermCount,
+									   &cache->deltaPostingCount,
+									   &cache->deltaCacheBytes, stats);
+	cache->deltaCacheBuilt = true;
+	cache->deltaCacheBytes = MemoryContextMemAllocated(cache->ctx, true);
 }
 
 static int
@@ -1477,14 +1515,16 @@ TqHybridBm25MatchedQuery(TSQuery query, TqHybridBm25QueryTerm *terms,
 }
 
 static void
-TqHybridBm25CountDeltaDf(TqHybridBm25Cache *cache,
+TqHybridBm25CountDeltaDf(TqHybridBm25DeltaCacheEntry *deltaTerms,
+						 uint32 deltaTermCount,
 						 TqHybridBm25QueryTerm *terms, int termCount)
 {
 	for (int termNo = 0; termNo < termCount; termNo++)
 	{
 		TqHybridBm25DeltaCacheEntry *entry;
 
-		entry = TqHybridBm25CacheFindDeltaEntry(cache, &terms[termNo]);
+		entry = TqHybridBm25FindDeltaEntry(deltaTerms, deltaTermCount,
+										   &terms[termNo]);
 		if (entry != NULL)
 			terms[termNo].deltaDf = entry->df;
 	}
@@ -1492,7 +1532,8 @@ TqHybridBm25CountDeltaDf(TqHybridBm25Cache *cache,
 
 static void
 TqHybridBm25ScoreDelta(const TqHybridBm25MetaTupleData *meta,
-					   TqHybridBm25Cache *cache,
+					   TqHybridBm25DeltaCacheEntry *deltaTerms,
+					   uint32 deltaTermCount,
 					   TqHybridBm25QueryTerm *terms, int termCount,
 					   TqHybridBm25Accumulator *acc,
 					   TqHybridBm25QueryStats *stats)
@@ -1509,7 +1550,8 @@ TqHybridBm25ScoreDelta(const TqHybridBm25MetaTupleData *meta,
 		uint32		df;
 		double		idf;
 
-		deltaEntry = TqHybridBm25CacheFindDeltaEntry(cache, term);
+		deltaEntry = TqHybridBm25FindDeltaEntry(deltaTerms, deltaTermCount,
+												term);
 		if (deltaEntry == NULL)
 			continue;
 
@@ -2107,47 +2149,64 @@ TqHybridBm25IteratorUpperBound(const TqHybridBm25MetaTupleData *meta,
 									   it->maxTf);
 }
 
-static int
-TqHybridBm25IteratorCompare(const void *a, const void *b)
+static void
+TqHybridBm25ActiveHeapSiftDown(TqHybridBm25PostingIterator **heap,
+							   int heapCount, int pos)
 {
-	const TqHybridBm25PostingIterator *ia =
-		*(const TqHybridBm25PostingIterator *const *) a;
-	const TqHybridBm25PostingIterator *ib =
-		*(const TqHybridBm25PostingIterator *const *) b;
-	uint32		na = TqHybridBm25IteratorNodeId(ia);
-	uint32		nb = TqHybridBm25IteratorNodeId(ib);
+	for (;;)
+	{
+		int			left = pos * 2 + 1;
+		int			right = left + 1;
+		int			smallest = pos;
 
-	return (na > nb) - (na < nb);
+		if (left < heapCount &&
+			TqHybridBm25IteratorNodeId(heap[left]) <
+			TqHybridBm25IteratorNodeId(heap[smallest]))
+			smallest = left;
+		if (right < heapCount &&
+			TqHybridBm25IteratorNodeId(heap[right]) <
+			TqHybridBm25IteratorNodeId(heap[smallest]))
+			smallest = right;
+		if (smallest == pos)
+			break;
+
+		{
+			TqHybridBm25PostingIterator *tmp = heap[pos];
+
+			heap[pos] = heap[smallest];
+			heap[smallest] = tmp;
+		}
+		pos = smallest;
+	}
 }
 
 static void
-TqHybridBm25SortActiveIterators(TqHybridBm25PostingIterator **active,
-								int activeCount,
-								TqHybridBm25QueryStats *stats)
+TqHybridBm25OrderActiveIterators(TqHybridBm25PostingIterator **active,
+								 TqHybridBm25PostingIterator **ordered,
+								 int activeCount,
+								 TqHybridBm25QueryStats *stats)
 {
+	int			heapCount = activeCount;
+
 	if (stats != NULL)
 		stats->wandActiveSorts++;
 
-	if (activeCount <= 8)
-	{
-		for (int i = 1; i < activeCount; i++)
-		{
-			TqHybridBm25PostingIterator *item = active[i];
-			int			j = i - 1;
+	for (int i = activeCount / 2 - 1; i >= 0; i--)
+		TqHybridBm25ActiveHeapSiftDown(active, activeCount, i);
 
-			while (j >= 0 &&
-				   TqHybridBm25IteratorNodeId(active[j]) >
-				   TqHybridBm25IteratorNodeId(item))
-			{
-				active[j + 1] = active[j];
-				j--;
-			}
-			active[j + 1] = item;
+	for (int i = 0; i < activeCount; i++)
+	{
+		ordered[i] = active[0];
+		heapCount--;
+		if (heapCount > 0)
+		{
+			active[0] = active[heapCount];
+			TqHybridBm25ActiveHeapSiftDown(active, heapCount, 0);
 		}
 	}
-	else
-		qsort(active, activeCount, sizeof(TqHybridBm25PostingIterator *),
-			  TqHybridBm25IteratorCompare);
+
+	memcpy(active, ordered, sizeof(TqHybridBm25PostingIterator *) *
+		   activeCount);
 }
 
 static double
@@ -2170,6 +2229,7 @@ TqHybridBm25ScoreBaseWand(Relation index,
 {
 	TqHybridBm25PostingIterator *iterators;
 	TqHybridBm25PostingIterator **active;
+	TqHybridBm25PostingIterator **ordered;
 	int			iteratorCount = 0;
 	double		corpusDocCount = Max((double) meta->docCount +
 									 (double) meta->deltaDocCount, 1.0);
@@ -2183,6 +2243,9 @@ TqHybridBm25ScoreBaseWand(Relation index,
 	active = MemoryContextAllocZero(memoryContext,
 									sizeof(TqHybridBm25PostingIterator *) *
 									Max(termCount, 1));
+	ordered = MemoryContextAllocZero(memoryContext,
+									 sizeof(TqHybridBm25PostingIterator *) *
+									 Max(termCount, 1));
 
 	for (int termNo = 0; termNo < termCount; termNo++)
 	{
@@ -2223,7 +2286,7 @@ TqHybridBm25ScoreBaseWand(Relation index,
 		if (activeCount == 0)
 			break;
 
-		TqHybridBm25SortActiveIterators(active, activeCount, stats);
+		TqHybridBm25OrderActiveIterators(active, ordered, activeCount, stats);
 
 		for (int i = 0; i < activeCount; i++)
 		{
@@ -2318,6 +2381,10 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 	const uint32 *docLens;
 	const ItemPointerData *heapTids;
 	const bool *liveNodes;
+	TqHybridBm25DeltaCacheEntry *deltaTerms = NULL;
+	uint32		deltaTermCount = 0;
+	uint32		deltaPostingCount = 0;
+	uint64		deltaCacheBytes = 0;
 	TqHybridBm25Accumulator acc;
 	TqHybridBm25QueryTerm *terms;
 	int			termCount;
@@ -2396,30 +2463,32 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 	heapTids = cache->heapTids;
 	liveNodes = cache->liveNodes;
 
-	TqHybridBm25EnsureDeltaCache(index, &bm25Meta, cache, stats);
-	TqHybridBm25CountDeltaDf(cache, terms, termCount);
+	if (tqhybrid_bm25_cache_max_mb > 0 && !cache->deltaCacheBuilt)
+	{
+		TqHybridBm25BuildDeltaCacheEntries(index, &bm25Meta, cache,
+										   terms, termCount, memoryContext,
+										   &deltaTerms, &deltaTermCount,
+										   &deltaPostingCount,
+										   &deltaCacheBytes, stats);
+	}
+	else
+	{
+		TqHybridBm25EnsureDeltaCache(index, &bm25Meta, cache, stats);
+		deltaTerms = cache->deltaTerms;
+		deltaTermCount = cache->deltaTermCount;
+		deltaPostingCount = cache->deltaPostingCount;
+		deltaCacheBytes = cache->deltaCacheBytes;
+	}
+	TqHybridBm25CountDeltaDf(deltaTerms, deltaTermCount, terms, termCount);
 	if (stats != NULL)
 	{
-		stats->deltaCacheBytes = cache->deltaCacheBytes;
-		stats->deltaCacheTerms = cache->deltaTermCount;
+		stats->deltaCacheBytes = deltaCacheBytes;
+		stats->deltaCacheTerms = deltaTermCount;
 		stats->cacheBytes = MemoryContextMemAllocated(cache->ctx, true);
 		stats->cacheDocstatsLoaded = cache->docStatsLoaded;
 		stats->cacheLivenessLoaded = cache->livenessLoaded;
-		if (tqhybrid_bm25_cache_max_mb > 0 &&
-			!cache->cacheLimitWarned &&
-			stats->cacheBytes >
-			(uint64) tqhybrid_bm25_cache_max_mb * 1024 * 1024)
-		{
-			cache->cacheLimitWarned = true;
-			ereport(WARNING,
-					(errmsg("turbohybrid BM25 cache exceeds hybrid.bm25_cache_max_mb"),
-					 errdetail("Cache for index \"%s\" uses " UINT64_FORMAT
-							   " bytes; limit is %d MB.",
-							   RelationGetRelationName(index),
-							   stats->cacheBytes,
-							   tqhybrid_bm25_cache_max_mb)));
-		}
 	}
+	(void) deltaPostingCount;
 	for (int termNo = 0; termNo < termCount; termNo++)
 	{
 		if (!terms[termNo].hasLexicon && terms[termNo].deltaDf > 0)
@@ -2577,7 +2646,8 @@ TqHybridBm25TopK(Relation index, TSQuery query, int32 k, bool useWand,
 		}
 	}
 
-	TqHybridBm25ScoreDelta(&bm25Meta, cache, terms, termCount, &acc, stats);
+	TqHybridBm25ScoreDelta(&bm25Meta, deltaTerms, deltaTermCount,
+						   terms, termCount, &acc, stats);
 
 	if (resolvedTerms == 0 || acc.touchedCount == 0)
 	{

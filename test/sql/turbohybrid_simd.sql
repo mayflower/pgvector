@@ -5,6 +5,14 @@ SET hnsw.tq_simd_force = scalar;
 SET hnsw.tq_exact_simd_force = scalar;
 SET hybrid.bm25_simd_force = scalar;
 
+DO $$
+BEGIN
+	PERFORM set_config('hybrid.bm25_simd_force', 'avx512f', true);
+	RAISE EXCEPTION 'expected unsupported BM25 SIMD force rejection';
+EXCEPTION WHEN invalid_parameter_value THEN
+END
+$$;
+
 SELECT tq_simd_capabilities()->>'dense_force' AS dense_force;
 SELECT tq_simd_capabilities()->>'exact_force' AS exact_force;
 SELECT tq_simd_capabilities()->>'bm25_force' AS bm25_force;

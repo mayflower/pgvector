@@ -253,8 +253,7 @@ typedef enum TqHybridBm25Kernel
 {
 	TQHYBRID_BM25_KERNEL_SCALAR,
 	TQHYBRID_BM25_KERNEL_NEON,
-	TQHYBRID_BM25_KERNEL_AVX2,
-	TQHYBRID_BM25_KERNEL_AVX512F
+	TQHYBRID_BM25_KERNEL_AVX2
 }			TqHybridBm25Kernel;
 
 extern int	tqhybrid_last_bm25_decode_kernel;

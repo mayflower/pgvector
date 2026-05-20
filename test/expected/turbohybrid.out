@@ -55,10 +55,11 @@ SELECT
 	(tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'postings_start_blkno')::int > 0 AS has_postings,
 	(tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'blockmax_start_blkno')::int > 0 AS has_blockmax,
 	(tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'postings_pages')::int > 0 AS has_postings_pages,
-	(tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'blockmax_pages')::int > 0 AS has_blockmax_pages;
- doc_count | total_doc_len | unique_terms | term_tuple_count | has_lexicon | has_postings | has_blockmax | has_postings_pages | has_blockmax_pages 
------------+---------------+--------------+------------------+-------------+--------------+--------------+--------------------+--------------------
- 3         | 7             | 5            | 7                | t           | t            | t            | t                  | t
+	(tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'blockmax_pages')::int > 0 AS has_blockmax_pages,
+	tq_debug_bm25_stats('tqh_docs_idx'::regclass)->>'bm25_precompute_tf_norm' AS precompute_tf_norm_default;
+ doc_count | total_doc_len | unique_terms | term_tuple_count | has_lexicon | has_postings | has_blockmax | has_postings_pages | has_blockmax_pages | precompute_tf_norm_default 
+-----------+---------------+--------------+------------------+-------------+--------------+--------------+--------------------+--------------------+----------------------------
+ 3         | 7             | 5            | 7                | t           | t            | t            | t                  | t                  | true
 (1 row)
 
 SELECT
@@ -167,6 +168,38 @@ LIMIT 2;
 (2 rows)
 
 RESET enable_seqscan;
+CREATE TABLE tqh_final_k_docs (
+	id int,
+	embedding vector(3),
+	body_tsv tsvector
+);
+INSERT INTO tqh_final_k_docs
+SELECT i, ('[' || i || ',0,0]')::vector, to_tsvector('english', 'common token')
+FROM generate_series(1, 30) i;
+CREATE INDEX tqh_final_k_docs_idx ON tqh_final_k_docs
+USING turbohybrid (
+	embedding vector_cosine_hybrid_ops,
+	body_tsv bm25_tsvector_ops
+);
+SET enable_seqscan = off;
+SELECT count(*) AS omitted_final_k_limit_count
+FROM (
+	SELECT id
+	FROM tqh_final_k_docs
+	ORDER BY embedding <~> hybrid_query(
+		text_query => to_tsquery('english', 'common'),
+		dense_k => 0,
+		bm25_k => 30
+	)
+	LIMIT 25
+) s;
+ omitted_final_k_limit_count 
+-----------------------------
+                          25
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE tqh_final_k_docs;
 CREATE TABLE tqh_sparse_docs (
 	id int,
 	embedding vector(3),
@@ -461,6 +494,39 @@ ORDER BY delta_cache_hit;
 (2 rows)
 
 DROP TABLE tqh_delta_cache_probe;
+CREATE TABLE tqh_delta_limit_docs (
+	id int,
+	embedding vector(3),
+	body_tsv tsvector
+);
+INSERT INTO tqh_delta_limit_docs VALUES
+	(1, '[1,0,0]', to_tsvector('english', 'base lexical'));
+CREATE INDEX tqh_delta_limit_docs_idx ON tqh_delta_limit_docs
+USING turbohybrid (
+	embedding vector_cosine_hybrid_ops,
+	body_tsv bm25_tsvector_ops
+);
+INSERT INTO tqh_delta_limit_docs VALUES
+	(2, '[0,1,0]', to_tsvector('english', 'bounded delta cache'));
+SET hybrid.bm25_cache_max_mb = 1;
+CREATE TEMP TABLE tqh_delta_limit_probe AS
+SELECT tq_debug_bm25_topk('tqh_delta_limit_docs_idx'::regclass, to_tsquery('english', 'bounded'), 3, false) AS stats;
+INSERT INTO tqh_delta_limit_probe
+SELECT tq_debug_bm25_topk('tqh_delta_limit_docs_idx'::regclass, to_tsquery('english', 'bounded'), 3, false);
+SELECT
+	bool_or((stats->>'delta_cache_hit')::bool) AS any_delta_cache_hit,
+	bool_and((stats->>'delta_cache_terms')::int = 1) AS only_query_delta_term,
+	bool_and((stats->>'delta_cache_bytes')::int > 0) AS has_query_delta_bytes,
+	bool_and((stats->>'delta_blocks_visited')::int > 0) AS scanned_delta_each_time
+FROM tqh_delta_limit_probe;
+ any_delta_cache_hit | only_query_delta_term | has_query_delta_bytes | scanned_delta_each_time 
+---------------------+-----------------------+-----------------------+-------------------------
+ f                   | t                     | t                     | t
+(1 row)
+
+RESET hybrid.bm25_cache_max_mb;
+DROP TABLE tqh_delta_limit_probe;
+DROP TABLE tqh_delta_limit_docs;
 SELECT id
 FROM tqh_docs
 ORDER BY embedding <~> hybrid_query(

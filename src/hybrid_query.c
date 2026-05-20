@@ -10,6 +10,7 @@
 #include "nodes/primnodes.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/memutils.h"
 
 #include "hybrid_query.h"
 #include "tqhybrid.h"
@@ -234,6 +235,14 @@ typedef struct HybridQueryPlanCheck
 	bool		hasIndexOrderByResjunkExpr;
 } HybridQueryPlanCheck;
 
+typedef struct HybridQueryPlanCheckCache
+{
+	PlannedStmt *plannedstmt;
+	Node	   *expr;
+	Oid			fnOid;
+	bool		result;
+} HybridQueryPlanCheckCache;
+
 static List *
 HybridQueryDistanceCallArgs(Node *expr, Oid *fnOid)
 {
@@ -335,6 +344,7 @@ static bool
 HybridQueryTextIndexOrderByContext(FunctionCallInfo fcinfo)
 {
 	PlannedStmt *plannedstmt;
+	HybridQueryPlanCheckCache *cache;
 	HybridQueryPlanCheck check;
 
 	if (fcinfo->flinfo == NULL || fcinfo->flinfo->fn_expr == NULL)
@@ -344,6 +354,13 @@ HybridQueryTextIndexOrderByContext(FunctionCallInfo fcinfo)
 	if (plannedstmt == NULL || plannedstmt->planTree == NULL)
 		return false;
 
+	cache = (HybridQueryPlanCheckCache *) fcinfo->flinfo->fn_extra;
+	if (cache != NULL &&
+		cache->plannedstmt == plannedstmt &&
+		cache->expr == fcinfo->flinfo->fn_expr &&
+		cache->fnOid == fcinfo->flinfo->fn_oid)
+		return cache->result;
+
 	check.expr = fcinfo->flinfo->fn_expr;
 	check.fnOid = fcinfo->flinfo->fn_oid;
 	check.hasUserVisibleExpr = false;
@@ -351,7 +368,23 @@ HybridQueryTextIndexOrderByContext(FunctionCallInfo fcinfo)
 
 	HybridQueryInspectPlan(plannedstmt->planTree, &check);
 
-	return check.hasIndexOrderByResjunkExpr && !check.hasUserVisibleExpr;
+	if (cache == NULL)
+	{
+		MemoryContext cacheCtx = fcinfo->flinfo->fn_mcxt != NULL ?
+			fcinfo->flinfo->fn_mcxt : TopMemoryContext;
+		MemoryContext oldCtx = MemoryContextSwitchTo(cacheCtx);
+
+		cache = palloc0(sizeof(HybridQueryPlanCheckCache));
+		fcinfo->flinfo->fn_extra = cache;
+		MemoryContextSwitchTo(oldCtx);
+	}
+
+	cache->plannedstmt = plannedstmt;
+	cache->expr = fcinfo->flinfo->fn_expr;
+	cache->fnOid = fcinfo->flinfo->fn_oid;
+	cache->result = check.hasIndexOrderByResjunkExpr && !check.hasUserVisibleExpr;
+
+	return cache->result;
 }
 
 static void

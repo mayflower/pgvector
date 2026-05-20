@@ -67,7 +67,6 @@ static const struct config_enum_entry tqhybrid_bm25_simd_force_options[] = {
 	{"auto", TQHYBRID_BM25_SIMD_FORCE_AUTO, false},
 	{"scalar", TQHYBRID_BM25_SIMD_FORCE_SCALAR, false},
 	{"avx2", TQHYBRID_BM25_SIMD_FORCE_AVX2, false},
-	{"avx512f", TQHYBRID_BM25_SIMD_FORCE_AVX512F, false},
 	{"neon", TQHYBRID_BM25_SIMD_FORCE_NEON, false},
 	{NULL, 0, false}
 };
@@ -90,8 +89,6 @@ TqHybridBm25SimdForceName(int force)
 			return "scalar";
 		case TQHYBRID_BM25_SIMD_FORCE_AVX2:
 			return "avx2";
-		case TQHYBRID_BM25_SIMD_FORCE_AVX512F:
-			return "avx512f";
 		case TQHYBRID_BM25_SIMD_FORCE_NEON:
 			return "neon";
 		default:
@@ -1464,7 +1461,7 @@ TqHybridInit(void)
 					   true, AccessExclusiveLock);
 	add_bool_reloption(tqhybrid_relopt_kind, "bm25_precompute_tf_norm",
 					   "Store compact precomputed BM25 term-frequency normalization per base posting.",
-					   false, AccessExclusiveLock);
+					   true, AccessExclusiveLock);
 	add_int_reloption(tqhybrid_relopt_kind, "bm25_delta_compaction_threshold",
 					  "Delta document percentage of the base BM25 segment that triggers vacuum compaction.",
 					  25, 1, 1000, AccessExclusiveLock);
@@ -1513,12 +1510,12 @@ TqHybridInit(void)
 							 "Reserved for rescoring experiments; default off keeps BM25-only scans lexical.",
 							 &tqhybrid_enable_exact_rescore_for_bm25_only,
 							 false, PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomIntVariable("hybrid.bm25_cache_max_mb", "Warn when a backend-local turbohybrid BM25 cache exceeds this size",
-							"Set to 0 to disable the warning.",
+	DefineCustomIntVariable("hybrid.bm25_cache_max_mb", "Maximum backend-local turbohybrid BM25 cache size before delta terms stay query-local",
+							"Set to 0 to allow the full backend-local delta cache.",
 							&tqhybrid_bm25_cache_max_mb,
 							0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomEnumVariable("hybrid.bm25_simd_force", "Force or disable turbohybrid BM25 SIMD dispatch",
-							 "auto uses supported BM25 SIMD kernels when available; scalar forces the reference path. Specific SIMD values are accepted for benchmark scripts and safely fall back until those kernels are implemented.",
+							 "auto uses supported BM25 SIMD kernels when available; scalar forces the reference path.",
 							 &tqhybrid_bm25_simd_force,
 							 TQHYBRID_BM25_SIMD_FORCE_AUTO,
 							 tqhybrid_bm25_simd_force_options,

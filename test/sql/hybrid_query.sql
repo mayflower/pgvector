@@ -5,7 +5,7 @@ SELECT hybrid_query_out(hybrid_query(
 	dense_k => 12,
 	bm25_k => 34,
 	rrf_k => 60
-))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=true,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=60,dense_k=12,bm25_k=34,final_k=20,require_bm25_match=false)' AS ok;
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=true,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=60,dense_k=12,bm25_k=34,final_k=null,require_bm25_match=false)' AS ok;
 
 SELECT hybrid_query_out(hybrid_query(
 	text_query => websearch_to_tsquery('english', 'postgres'),
@@ -29,11 +29,11 @@ SELECT hybrid_query_out(hybrid_query(
 	rrf_k => NULL,
 	dense_k => NULL,
 	bm25_k => NULL
-))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=9,dense_k=7,bm25_k=8,final_k=20,require_bm25_match=false)' AS explicit_null_guc_defaults;
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=9,dense_k=7,bm25_k=8,final_k=null,require_bm25_match=false)' AS explicit_null_guc_defaults;
 
 SELECT hybrid_query_out(hybrid_query(
 	vector_query => '[1,0,0]'::vector
-))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=9,dense_k=7,bm25_k=8,final_k=20,require_bm25_match=false)' AS omitted_guc_defaults;
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=9,dense_k=7,bm25_k=8,final_k=null,require_bm25_match=false)' AS omitted_guc_defaults;
 
 RESET hybrid.default_dense_k;
 RESET hybrid.default_bm25_k;
@@ -55,7 +55,7 @@ SELECT
 	('[2,0,0]'::vector <~#> hybrid_query(vector_query => '[1,0,0]'::vector)) = -2 AS ip_ok,
 	('[2,0,0]'::vector <~> hybrid_query(vector_query => '[1,0,0]'::vector)) = 0 AS cosine_ok;
 
-SELECT bool_and(provolatile = 'i' AND proparallel = 's') AS hybrid_distance_functions_are_pure
+SELECT bool_and(provolatile = 's' AND proparallel = 'u') AS hybrid_distance_functions_are_plan_context_aware
 FROM pg_proc
 WHERE proname IN (
 	'hybrid_distance',

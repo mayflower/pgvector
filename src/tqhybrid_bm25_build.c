@@ -90,6 +90,13 @@ typedef struct TqHybridBm25SpillCursor
 	char	   *termBytes;
 } TqHybridBm25SpillCursor;
 
+typedef struct TqHybridBm25SpillHeap
+{
+	TqHybridBm25SpillCursor *cursors;
+	int		   *items;
+	uint32		count;
+} TqHybridBm25SpillHeap;
+
 typedef struct TqHybridBm25DebugEntry
 {
 	Oid			indexOid;
@@ -199,7 +206,7 @@ TqHybridBm25PrecomputeTfNormEnabled(TqHybridBm25Collector *collector)
 {
 	TqHybridOptions *opts = (TqHybridOptions *) collector->index->rd_options;
 
-	return opts != NULL && opts->bm25PrecomputeTfNorm;
+	return opts == NULL || opts->bm25PrecomputeTfNorm;
 }
 
 static uint16
@@ -1775,17 +1782,90 @@ TqHybridSpillCursorCompare(const TqHybridBm25SpillCursor *a,
 }
 
 static int
-TqHybridFindNextSpillCursor(TqHybridBm25SpillCursor *cursors, uint32 count)
+TqHybridSpillHeapCompare(TqHybridBm25SpillHeap *heap, int left, int right)
 {
-	int			best = -1;
+	return TqHybridSpillCursorCompare(&heap->cursors[left],
+									  &heap->cursors[right]);
+}
 
-	for (uint32 i = 0; i < count; i++)
+static void
+TqHybridSpillHeapSwap(TqHybridBm25SpillHeap *heap, uint32 left, uint32 right)
+{
+	int			tmp = heap->items[left];
+
+	heap->items[left] = heap->items[right];
+	heap->items[right] = tmp;
+}
+
+static void
+TqHybridSpillHeapSiftUp(TqHybridBm25SpillHeap *heap, uint32 pos)
+{
+	while (pos > 0)
 	{
-		if (!cursors[i].valid)
-			continue;
-		if (best < 0 ||
-			TqHybridSpillCursorCompare(&cursors[i], &cursors[best]) < 0)
-			best = (int) i;
+		uint32		parent = (pos - 1) / 2;
+
+		if (TqHybridSpillHeapCompare(heap, heap->items[pos],
+									 heap->items[parent]) >= 0)
+			break;
+		TqHybridSpillHeapSwap(heap, pos, parent);
+		pos = parent;
+	}
+}
+
+static void
+TqHybridSpillHeapSiftDown(TqHybridBm25SpillHeap *heap, uint32 pos)
+{
+	for (;;)
+	{
+		uint32		left = pos * 2 + 1;
+		uint32		right = left + 1;
+		uint32		smallest = pos;
+
+		if (left < heap->count &&
+			TqHybridSpillHeapCompare(heap, heap->items[left],
+									 heap->items[smallest]) < 0)
+			smallest = left;
+		if (right < heap->count &&
+			TqHybridSpillHeapCompare(heap, heap->items[right],
+									 heap->items[smallest]) < 0)
+			smallest = right;
+		if (smallest == pos)
+			break;
+		TqHybridSpillHeapSwap(heap, pos, smallest);
+		pos = smallest;
+	}
+}
+
+static void
+TqHybridSpillHeapPush(TqHybridBm25SpillHeap *heap, int cursor)
+{
+	heap->items[heap->count] = cursor;
+	TqHybridSpillHeapSiftUp(heap, heap->count);
+	heap->count++;
+}
+
+static int
+TqHybridSpillHeapPeek(TqHybridBm25SpillHeap *heap)
+{
+	if (heap->count == 0)
+		return -1;
+	return heap->items[0];
+}
+
+static int
+TqHybridSpillHeapPop(TqHybridBm25SpillHeap *heap)
+{
+	int			best;
+
+	if (heap->count == 0)
+		return -1;
+
+	best = heap->items[0];
+	heap->count--;
+	if (heap->count > 0)
+	{
+		heap->items[0] = heap->items[heap->count];
+		TqHybridSpillHeapSiftDown(heap, 0);
 	}
 
 	return best;
@@ -1848,12 +1928,16 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 	Page		blockMaxPage = NULL;
 	BlockNumber lexStart = InvalidBlockNumber;
 	TqHybridBm25SpillCursor *cursors;
+	TqHybridBm25SpillHeap heap;
 	TqHybridBm25Posting *chunk;
 	uint16		maxPerChunk = TqHybridBm25MaxPostingsPerChunk();
 	uint32		termId = 0;
 
 	cursors = palloc0(sizeof(TqHybridBm25SpillCursor) *
 					  collector->spillRunCount);
+	heap.cursors = cursors;
+	heap.items = palloc(sizeof(int) * collector->spillRunCount);
+	heap.count = 0;
 	chunk = palloc(sizeof(TqHybridBm25Posting) * maxPerChunk);
 
 	for (uint32 i = 0; i < collector->spillRunCount; i++)
@@ -1862,13 +1946,13 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 		cursors[i].remaining = collector->spillRuns[i].tupleCount;
 		if (BufFileSeek(collector->spillRuns[i].file, 0, 0L, SEEK_SET) != 0)
 			elog(ERROR, "failed to rewind turbohybrid BM25 spill run");
-		(void) TqHybridSpillCursorRead(&cursors[i]);
+		if (TqHybridSpillCursorRead(&cursors[i]))
+			TqHybridSpillHeapPush(&heap, (int) i);
 	}
 
 	for (;;)
 	{
-		int			best = TqHybridFindNextSpillCursor(cursors,
-													   collector->spillRunCount);
+		int			best = TqHybridSpillHeapPeek(&heap);
 		uint64		termHash;
 		uint16		termLen;
 		char	   *termBytes;
@@ -1902,6 +1986,7 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 		{
 			uint32		nodeId = cursors[best].nodeId;
 			uint16		tf = cursors[best].tf;
+			int			cursor;
 
 			if (nodeId != prevNode)
 			{
@@ -1948,9 +2033,11 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 				chunkCount = 0;
 			}
 
-			(void) TqHybridSpillCursorRead(&cursors[best]);
-			best = TqHybridFindNextSpillCursor(cursors,
-											   collector->spillRunCount);
+			cursor = TqHybridSpillHeapPop(&heap);
+			Assert(cursor == best);
+			if (TqHybridSpillCursorRead(&cursors[cursor]))
+				TqHybridSpillHeapPush(&heap, cursor);
+			best = TqHybridSpillHeapPeek(&heap);
 		}
 
 		if (chunkCount > 0)
@@ -1997,6 +2084,7 @@ TqHybridWriteLexiconAndPostingsFromRuns(TqHybridBm25Collector *collector)
 
 	for (uint32 i = 0; i < collector->spillRunCount; i++)
 		TqHybridSpillCursorCloseCurrent(&cursors[i]);
+	pfree(heap.items);
 	pfree(cursors);
 	pfree(chunk);
 
@@ -2095,7 +2183,7 @@ TqHybridWriteMeta(TqHybridBm25Collector *collector)
 
 	memset(&tuple, 0, sizeof(tuple));
 	tuple.type = TQHYBRID_BM25_META_TUPLE_TYPE;
-	if (opts != NULL && opts->bm25PrecomputeTfNorm)
+	if (opts == NULL || opts->bm25PrecomputeTfNorm)
 		tuple.reserved2 |= TQHYBRID_BM25_META_FLAG_TFNORM_Q16;
 	tuple.bm25Version = TQHYBRID_BM25_VERSION;
 	tuple.docCount = collector->docCount;
@@ -2441,7 +2529,7 @@ TqHybridBm25UpdateCompactedMeta(Relation index,
 				 errmsg("turbohybrid BM25 metadata is missing")));
 
 	metaTuple->docCount = collector->docCount;
-	if (opts != NULL && opts->bm25PrecomputeTfNorm)
+	if (opts == NULL || opts->bm25PrecomputeTfNorm)
 		metaTuple->reserved2 |= TQHYBRID_BM25_META_FLAG_TFNORM_Q16;
 	else
 		metaTuple->reserved2 &= ~TQHYBRID_BM25_META_FLAG_TFNORM_Q16;
