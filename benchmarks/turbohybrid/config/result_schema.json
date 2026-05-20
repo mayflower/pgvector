@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurboHybrid benchmark result",
+  "type": "object",
+  "required": ["suite", "layer", "results"],
+  "properties": {
+    "suite": {
+      "type": "string"
+    },
+    "layer": {
+      "enum": ["ir_quality", "systems", "reference"]
+    },
+    "generated_at_unix": {
+      "type": "integer"
+    },
+    "dataset": {
+      "type": "string"
+    },
+    "method": {
+      "type": "string"
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "environment": {
+      "type": "object"
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

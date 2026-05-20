@@ -15,6 +15,7 @@
 #include "libpq/pqformat.h"
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
+#include "tqhybrid.h"
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
@@ -39,6 +40,27 @@
 #define VECTOR_TARGET_CLONES
 #endif
 
+/*
+ * Explicit AVX-512F target macro for the hand-tuned exact-rescore
+ * kernels.  The macro disambiguates "compile-time can
+ * emit AVX-512" (gcc/clang on x86) from "runtime CPU has AVX-512";
+ * the runtime gate uses __builtin_cpu_supports("avx512f") plus the
+ * hnsw.tq_exact_avx512 GUC kill-switch.
+ */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(__GNUC__) || defined(__clang__)
+#define VECTOR_AVX512F_AVAILABLE 1
+#define VECTOR_AVX512F_TARGET __attribute__((target("avx512f")))
+#include <immintrin.h>
+#else
+#define VECTOR_AVX512F_AVAILABLE 0
+#define VECTOR_AVX512F_TARGET
+#endif
+#else
+#define VECTOR_AVX512F_AVAILABLE 0
+#define VECTOR_AVX512F_TARGET
+#endif
+
 #if PG_VERSION_NUM >= 180000
 PG_MODULE_MAGIC_EXT(.name = "vector",.version = "0.8.2");
 #else
@@ -56,6 +78,7 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
+	TqHybridInit();
 }
 
 /*
@@ -551,8 +574,12 @@ halfvec_to_vector(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
+/* Forward decls for the GUC-aware L2/IP dispatchers (defined below). */
+static float VectorL2SquaredDistance(int dim, float *ax, float *bx);
+static float VectorInnerProduct(int dim, float *ax, float *bx);
+
 VECTOR_TARGET_CLONES static float
-VectorL2SquaredDistance(int dim, float *ax, float *bx)
+VectorL2SquaredDistanceAutoVec(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
 
@@ -599,7 +626,7 @@ vector_l2_squared_distance(PG_FUNCTION_ARGS)
 }
 
 VECTOR_TARGET_CLONES static float
-VectorInnerProduct(int dim, float *ax, float *bx)
+VectorInnerProductAutoVec(int dim, float *ax, float *bx)
 {
 	float		distance = 0.0;
 
@@ -687,6 +714,109 @@ cosine_distance(PG_FUNCTION_ARGS)
 		similarity = -1.0;
 
 	PG_RETURN_FLOAT8(1.0 - similarity);
+}
+
+/*
+ * Explicit AVX-512F exact-rescore kernels.
+ *
+ * The default rescore path uses VectorL2SquaredDistance and
+ * VectorInnerProduct, both annotated with target_clones("default",
+ * "fma") so on every modern x86 host the auto-vectorizer emits
+ * AVX+FMA code (256-bit YMM, 8 f32 per FMA).  AVX-512F can do 16
+ * f32 per FMA (1.5-2× wider) but historically downclocks the core
+ * on Skylake-X / Cascade Lake under sustained heavy use.
+ *
+ * These kernels are runtime-gated by the hnsw.tq_exact_avx512 GUC
+ * (default off) so the AVX-512 path is opt-in until a host
+ * profiles cleanly.  They produce results that differ from the
+ * scalar/FMA path by at most a few ULPs (different sum order +
+ * possible FMA fusing in the compiler-generated FMA path), so the
+ * parity test uses a small relative tolerance.
+ */
+#if VECTOR_AVX512F_AVAILABLE
+static float VECTOR_AVX512F_TARGET
+VectorL2SquaredDistanceAvx512f(int dim, const float *ax, const float *bx)
+{
+	__m512		acc = _mm512_setzero_ps();
+	int			i = 0;
+
+	for (; i + 16 <= dim; i += 16)
+	{
+		__m512		a = _mm512_loadu_ps(ax + i);
+		__m512		b = _mm512_loadu_ps(bx + i);
+		__m512		d = _mm512_sub_ps(a, b);
+
+		acc = _mm512_fmadd_ps(d, d, acc);
+	}
+
+	{
+		float		distance = _mm512_reduce_add_ps(acc);
+
+		for (; i < dim; i++)
+		{
+			float		diff = ax[i] - bx[i];
+
+			distance += diff * diff;
+		}
+		return distance;
+	}
+}
+
+static float VECTOR_AVX512F_TARGET
+VectorInnerProductAvx512f(int dim, const float *ax, const float *bx)
+{
+	__m512		acc = _mm512_setzero_ps();
+	int			i = 0;
+
+	for (; i + 16 <= dim; i += 16)
+	{
+		__m512		a = _mm512_loadu_ps(ax + i);
+		__m512		b = _mm512_loadu_ps(bx + i);
+
+		acc = _mm512_fmadd_ps(a, b, acc);
+	}
+
+	{
+		float		distance = _mm512_reduce_add_ps(acc);
+
+		for (; i < dim; i++)
+			distance += ax[i] * bx[i];
+		return distance;
+	}
+}
+#endif
+
+/*
+ * Runtime dispatcher for VectorL2SquaredDistance — picks the AVX-512F
+ * kernel when the GUC is on AND the CPU supports AVX-512F, otherwise
+ * the autoVec'd FMA path.  This is the *single* call site for L2
+ * exact rescore, so the GUC kill-switch routes every l2_distance /
+ * vector_l2_squared_distance call through the chosen kernel.  The
+ * GUC dispatch overhead (~3 cycles per call) is negligible vs the
+ * per-call FMA work even at small dim.
+ */
+static float
+VectorL2SquaredDistance(int dim, float *ax, float *bx)
+{
+#if VECTOR_AVX512F_AVAILABLE
+	if (hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_SCALAR &&
+		hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_NEON &&
+		hnsw_tq_exact_avx512 && __builtin_cpu_supports("avx512f"))
+		return VectorL2SquaredDistanceAvx512f(dim, ax, bx);
+#endif
+	return VectorL2SquaredDistanceAutoVec(dim, ax, bx);
+}
+
+static float
+VectorInnerProduct(int dim, float *ax, float *bx)
+{
+#if VECTOR_AVX512F_AVAILABLE
+	if (hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_SCALAR &&
+		hnsw_tq_exact_simd_force != TQ_EXACT_SIMD_FORCE_NEON &&
+		hnsw_tq_exact_avx512 && __builtin_cpu_supports("avx512f"))
+		return VectorInnerProductAvx512f(dim, ax, bx);
+#endif
+	return VectorInnerProductAutoVec(dim, ax, bx);
 }
 
 /*

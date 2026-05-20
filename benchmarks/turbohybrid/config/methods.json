@@ -1,0 +1,58 @@
+{
+  "methods": [
+    {
+      "name": "turbohybrid",
+      "layer": "systems",
+      "kind": "postgres_index_am",
+      "description": "Native TurboQuant graph plus in-index BM25 with hybrid_query fusion."
+    },
+    {
+      "name": "postgres_sql_rrf",
+      "layer": "reference",
+      "kind": "postgres_sql",
+      "description": "Postgres GIN FTS plus pgvector HNSW, fused with SQL-level reciprocal rank fusion."
+    },
+    {
+      "name": "turboquant_dense",
+      "layer": "reference",
+      "kind": "postgres_index_am",
+      "description": "TurboQuant dense-only baseline on the same synthetic vectors."
+    },
+    {
+      "name": "pyserini_lucene_bm25",
+      "layer": "reference",
+      "kind": "external_ir",
+      "description": "Pyserini/Anserini Lucene BM25 sparse baseline."
+    },
+    {
+      "name": "pyserini_lucene_hybrid",
+      "layer": "reference",
+      "kind": "external_ir",
+      "description": "Lucene BM25 fused with dense run files through RRF or weighted score fusion."
+    },
+    {
+      "name": "paradedb_bm25",
+      "layer": "reference",
+      "kind": "postgres_extension",
+      "description": "ParadeDB BM25 latency and storage baseline. Use for systems comparison, not as the only relevance proof."
+    },
+    {
+      "name": "elasticsearch_hybrid",
+      "layer": "reference",
+      "kind": "external_service_optional",
+      "description": "Optional Elastic/OpenSearch lexical+dense hybrid baseline."
+    },
+    {
+      "name": "qdrant_hybrid",
+      "layer": "reference",
+      "kind": "external_service_optional",
+      "description": "Optional Qdrant dense+sparse hybrid baseline."
+    },
+    {
+      "name": "weaviate_hybrid",
+      "layer": "reference",
+      "kind": "external_service_optional",
+      "description": "Optional Weaviate hybrid search baseline."
+    }
+  ]
+}

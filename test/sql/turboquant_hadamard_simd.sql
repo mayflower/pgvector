@@ -1,0 +1,88 @@
+-- Hadamard SIMD bit-exact parity.
+--
+-- Builds the same TurboQuant graph index twice on identical data,
+-- once with hnsw.tq_hadamard_simd = on (default) and once with the
+-- GUC off (forces scalar Hadamard butterfly).  Asserts the two
+-- indexes produce *identical* search results — proving the SIMD
+-- and scalar Hadamard paths are bit-exact equivalent.
+--
+-- This is the regression-floor check for the AVX2 / NEON Hadamard
+-- butterfly added in this commit.  If the SIMD path drifts (e.g. an
+-- intrinsic substitution introduces FMA semantics or reorders adds),
+-- the assertion below fires.
+
+SET enable_seqscan = off;
+
+CREATE TEMP TABLE tq_hd_data AS
+SELECT id, ARRAY(
+    SELECT sin(0.31415 * (k + id))::real FROM generate_series(0, 1535) k
+)::vector(1536) AS val
+FROM generate_series(1, 64) id;
+
+-- GUC default is on.
+SHOW hnsw.tq_hadamard_simd;
+
+-- Snapshot top-10 self-search results under SIMD-on Hadamard.
+SET hnsw.tq_hadamard_simd = on;
+CREATE INDEX tq_hd_idx ON tq_hd_data
+  USING turboquant (val vector_cosine_ops)
+  WITH (routing = graph);
+
+CREATE TEMP TABLE tq_hd_simd_results AS
+SELECT
+    probe.id AS probe_id,
+    array_agg(t.id ORDER BY t.id) AS top10_ids
+FROM tq_hd_data probe,
+     LATERAL (
+        SELECT id FROM tq_hd_data
+        ORDER BY val <=> probe.val
+        LIMIT 10
+     ) t
+WHERE probe.id <= 8
+GROUP BY probe.id;
+
+DROP INDEX tq_hd_idx;
+
+-- Now build the same index but with SIMD off (forces scalar
+-- butterfly) and snapshot the same probes.
+SET hnsw.tq_hadamard_simd = off;
+CREATE INDEX tq_hd_idx ON tq_hd_data
+  USING turboquant (val vector_cosine_ops)
+  WITH (routing = graph);
+
+CREATE TEMP TABLE tq_hd_scalar_results AS
+SELECT
+    probe.id AS probe_id,
+    array_agg(t.id ORDER BY t.id) AS top10_ids
+FROM tq_hd_data probe,
+     LATERAL (
+        SELECT id FROM tq_hd_data
+        ORDER BY val <=> probe.val
+        LIMIT 10
+     ) t
+WHERE probe.id <= 8
+GROUP BY probe.id;
+
+DROP INDEX tq_hd_idx;
+RESET hnsw.tq_hadamard_simd;
+
+-- Bit-exact parity assertion: every probe must produce identical
+-- top-10 IDs across both Hadamard paths.  If 1 ULP of drift in the
+-- rotation causes a tie-break to flip, this fails — that's the
+-- intended sensitivity.
+DO $$
+DECLARE
+    diff_count int;
+BEGIN
+    SELECT count(*)
+    INTO diff_count
+    FROM tq_hd_simd_results s
+    FULL JOIN tq_hd_scalar_results t USING (probe_id)
+    WHERE s.top10_ids IS DISTINCT FROM t.top10_ids;
+
+    IF diff_count > 0 THEN
+        RAISE EXCEPTION
+            'Hadamard SIMD vs scalar parity broken on % of 8 probes',
+            diff_count;
+    END IF;
+END $$;

@@ -82,7 +82,7 @@ ivfflatbuildphasename(int64 phasenum)
 /*
  * Estimate the cost of an index scan
  */
-static void
+void
 ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 					Cost *indexStartupCost, Cost *indexTotalCost,
 					Selectivity *indexSelectivity, double *indexCorrelation,

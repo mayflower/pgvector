@@ -12,3 +12,5 @@ regression.*
 *.obj
 *.lib
 *.exp
+__pycache__/
+*.pyc

@@ -661,6 +661,41 @@ SELECT * FROM (
 
 ## Performance
 
+### TurboHybrid Benchmark Suite
+
+The `turbohybrid` branch has a broader benchmark suite in
+[`benchmarks/turbohybrid`](benchmarks/turbohybrid). It separates IR quality
+benchmarks, systems benchmarks, and reference-tool comparisons so hybrid ranking
+quality is not inferred from a single latency test. The suite covers
+BEIR/MTEB, MS MARCO/TREC-DL, MIRACL, LoTTE, BRIGHT, a small RAG/end-to-end set,
+Postgres systems measurements, Postgres FTS + pgvector SQL RRF, Lucene,
+ParadeDB, and optional external hybrid engines.
+
+### RAG Benchmarks
+
+Hybrid FIQA RAG benchmark with 57,638 `text-embedding-3-small` corpus vectors,
+648 test queries, `k = 10`, 1 warmup pass, 1 measured pass, `dense_k = 400`,
+and `bm25_k = 400`. Latency is measured inside PostgreSQL with
+`clock_timestamp()` around each retrieval query, so process startup is not part
+of the timing.
+
+| Method | Build ms | Index MB | p50 ms | p95 ms | p99 ms | nDCG@10 | qrels recall@10 | QPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pgvector HNSW + Postgres FTS SQL RRF | 176,607.923 | 468.54 | 23.364 | 60.289 | 81.790 | 0.4175 | 0.4976 | 33.434 |
+| TurboHybrid, 4-bit, exact storage on | 212,029.072 | 420.34 | 13.220 | 30.169 | 38.612 | 0.4197 | 0.4971 | 65.883 |
+| TurboHybrid, 4-bit, exact storage off | 70,200.796 | 80.01 | 4.868 | 12.655 | 15.804 | 0.4191 | 0.4932 | 170.949 |
+
+In this full FIQA hybrid run, TurboHybrid with exact storage on has similar
+retrieval quality and about 2x lower p95/p99 latency than the normal pgvector
+SQL-level RRF baseline, with a 10.3% smaller index. With exact storage off, the
+same benchmark keeps nDCG@10 essentially flat, trades a small qrels recall@10
+drop, and reduces the hybrid index to 80.01 MiB while lowering p95 latency to
+12.655 ms. The pgvector HNSW build reported a `maintenance_work_mem` spill, so
+publishable build-time numbers should pin and report Postgres memory settings.
+
+Full details are in
+[`benchmarks/turbohybrid/results/real_rag_fiqa_2026-05-20.md`](benchmarks/turbohybrid/results/real_rag_fiqa_2026-05-20.md).
+
 ### Tuning
 
 Use a tool like [PgTune](https://pgtune.leopard.in.ua/) to set initial values for Postgres server parameters. For instance, `shared_buffers` should typically be 25% of the server’s memory. You can find the config file with:

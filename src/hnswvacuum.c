@@ -51,6 +51,7 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 
 	while (BlockNumberIsValid(blkno))
 	{
+		BlockNumber currentBlkno = blkno;
 		Buffer		buf;
 		Page		page;
 		GenericXLogState *state;
@@ -105,6 +106,7 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 						ItemPointerSetInvalid(&etup->heaptids[i]);
 
 					updated = true;
+					HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_VACUUM_DELETE);
 				}
 			}
 
@@ -137,6 +139,8 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 			GenericXLogAbort(state);
 
 		UnlockReleaseBuffer(buf);
+		if (updated)
+			HnswLogGraphWalRecord(index, MAIN_FORKNUM, currentBlkno, HNSW_GRAPH_OP_VACUUM_DELETE);
 	}
 }
 
@@ -207,6 +211,7 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	BufferAccessStrategy bas = vacuumstate->bas;
 	HnswNeighborTuple ntup = vacuumstate->ntup;
 	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+	BlockNumber blkno;
 	char	   *base = NULL;
 
 	/* Skip if element is entry point */
@@ -236,10 +241,13 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	/* Overwrite tuple */
 	if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
 		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+	HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_VACUUM_REPAIR);
+	blkno = BufferGetBlockNumber(buf);
 
 	/* Commit */
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
+	HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno, HNSW_GRAPH_OP_VACUUM_REPAIR);
 
 	/* Update neighbors */
 	HnswUpdateNeighborsOnDisk(index, support, element, m, true, false);
@@ -549,6 +557,8 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			if (etup->version > 15)
 				etup->version = 1;
 			ntup->version = etup->version;
+			HnswMarkPageGraphOp(page, HNSW_GRAPH_OP_VACUUM_DELETE);
+			HnswMarkPageGraphOp(npage, HNSW_GRAPH_OP_VACUUM_DELETE);
 
 			/*
 			 * We modified the tuples in place, no need to call
@@ -559,6 +569,9 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			GenericXLogFinish(state);
 			if (nbuf != buf)
 				UnlockReleaseBuffer(nbuf);
+			HnswLogGraphWalRecord(index, MAIN_FORKNUM, blkno, HNSW_GRAPH_OP_VACUUM_DELETE);
+			if (nbuf != buf)
+				HnswLogGraphWalRecord(index, MAIN_FORKNUM, neighborPage, HNSW_GRAPH_OP_VACUUM_DELETE);
 
 			/* Set to first free page */
 			if (!BlockNumberIsValid(insertPage))
