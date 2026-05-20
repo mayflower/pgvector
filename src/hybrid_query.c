@@ -14,10 +14,6 @@
 #include "hybrid_query.h"
 #include "tqhybrid.h"
 
-#define HYBRID_QUERY_DEFAULT_RRF_K 60
-#define HYBRID_QUERY_DEFAULT_DENSE_K 400
-#define HYBRID_QUERY_DEFAULT_BM25_K 400
-
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
 #endif
@@ -438,13 +434,13 @@ hybrid_query(PG_FUNCTION_ARGS)
 		flags |= HYBRID_QUERY_FLAG_ALPHA_IS_SET;
 	}
 
-	rrfK = PG_ARGISNULL(6) ? HYBRID_QUERY_DEFAULT_RRF_K : PG_GETARG_INT32(6);
+	rrfK = PG_ARGISNULL(6) ? tqhybrid_default_rrf_k : PG_GETARG_INT32(6);
 	HybridQueryCheckPositiveInt("rrf_k", rrfK);
 
-	denseK = PG_ARGISNULL(7) ? HYBRID_QUERY_DEFAULT_DENSE_K : PG_GETARG_INT32(7);
+	denseK = PG_ARGISNULL(7) ? tqhybrid_default_dense_k : PG_GETARG_INT32(7);
 	HybridQueryCheckNonNegativeInt("dense_k", denseK);
 
-	bm25K = PG_ARGISNULL(8) ? HYBRID_QUERY_DEFAULT_BM25_K : PG_GETARG_INT32(8);
+	bm25K = PG_ARGISNULL(8) ? tqhybrid_default_bm25_k : PG_GETARG_INT32(8);
 	HybridQueryCheckNonNegativeInt("bm25_k", bm25K);
 
 	if (!PG_ARGISNULL(9))

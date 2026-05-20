@@ -2593,6 +2593,7 @@ TqHybridBm25BuildCollect(Relation heap, Relation index, IndexInfo *indexInfo)
 	MemoryContext ctx;
 	MemoryContext oldCtx;
 	TqHybridBm25Collector collector;
+	HnswMetaPageData graphMeta;
 	uint32		uniqueTerms;
 
 	if (heap == NULL)
@@ -2607,12 +2608,20 @@ TqHybridBm25BuildCollect(Relation heap, Relation index, IndexInfo *indexInfo)
 	collector.index = index;
 	collector.softBudget = (Size) maintenance_work_mem * 1024L;
 	collector.allowSpill = true;
-	collector.tidNodes = TqHybridReadNodeMap(index, &collector.tidNodeCount);
 
-	if (collector.tidNodeCount == 0)
+	if (!TqGraphReadMeta(index, &graphMeta))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("turbohybrid BM25 collection requires native TurboQuant graph storage")));
+
+	if (graphMeta.tqNodeCount > 0)
+	{
+		collector.tidNodes = TqHybridReadNodeMap(index, &collector.tidNodeCount);
+		if (collector.tidNodeCount == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("turbohybrid native graph storage is missing during BM25 collection")));
+	}
 
 	TqHybridCheckBudget(&collector);
 	(void) table_index_build_scan(heap, index, indexInfo,

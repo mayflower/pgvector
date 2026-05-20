@@ -29,7 +29,11 @@ SELECT hybrid_query_out(hybrid_query(
 	rrf_k => NULL,
 	dense_k => NULL,
 	bm25_k => NULL
-))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=60,dense_k=400,bm25_k=400,final_k=20,require_bm25_match=false)' AS immutable_defaults;
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=9,dense_k=7,bm25_k=8,final_k=20,require_bm25_match=false)' AS explicit_null_guc_defaults;
+
+SELECT hybrid_query_out(hybrid_query(
+	vector_query => '[1,0,0]'::vector
+))::text = 'hybrid_query(fusion=rrf,vector=true,tsquery=false,dense_weight=1,bm25_weight=1,alpha=null,rrf_k=9,dense_k=7,bm25_k=8,final_k=20,require_bm25_match=false)' AS omitted_guc_defaults;
 
 RESET hybrid.default_dense_k;
 RESET hybrid.default_bm25_k;

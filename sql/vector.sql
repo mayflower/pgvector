@@ -54,13 +54,13 @@ CREATE FUNCTION hybrid_query(
 	dense_weight float8 DEFAULT 1.0,
 	bm25_weight float8 DEFAULT 1.0,
 	alpha float8 DEFAULT NULL,
-	rrf_k int4 DEFAULT 60,
-	dense_k int4 DEFAULT 400,
-	bm25_k int4 DEFAULT 400,
+	rrf_k int4 DEFAULT NULL,
+	dense_k int4 DEFAULT NULL,
+	bm25_k int4 DEFAULT NULL,
 	final_k int4 DEFAULT 20,
 	require_bm25_match bool DEFAULT false
 ) RETURNS hybrid_query
-	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE PARALLEL SAFE;
+	AS 'MODULE_PATHNAME' LANGUAGE C STABLE PARALLEL SAFE;
 
 CREATE FUNCTION hybrid_distance(vector, hybrid_query) RETURNS float8
 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

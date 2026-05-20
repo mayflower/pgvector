@@ -1,3 +1,22 @@
+CREATE TABLE tqh_empty_docs (
+	id int,
+	embedding vector(3),
+	body_tsv tsvector
+);
+
+CREATE INDEX tqh_empty_docs_idx ON tqh_empty_docs
+USING turbohybrid (
+	embedding vector_cosine_hybrid_ops,
+	body_tsv bm25_tsvector_ops
+);
+
+SELECT
+	tq_debug_bm25_stats('tqh_empty_docs_idx'::regclass)->>'doc_count' AS empty_doc_count,
+	tq_debug_bm25_stats('tqh_empty_docs_idx'::regclass)->>'unique_terms' AS empty_unique_terms,
+	(tq_debug_bm25_stats('tqh_empty_docs_idx'::regclass)->>'meta_blkno')::int > 0 AS empty_has_meta;
+
+DROP TABLE tqh_empty_docs;
+
 CREATE TABLE tqh_docs (
 	id int,
 	tenant_id int,
